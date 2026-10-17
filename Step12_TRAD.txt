@@ -1,0 +1,906 @@
+"""
+=============================================================================
+ Step 12  ->  TRAD post-extract checks & repairs        (PySpark, Phase 1)
+=============================================================================
+
+ Runs AFTER Step 11 (valuation_extract_trad_select.py) has written the TRAD
+ extract table, and BEFORE Step 14 file generation.
+
+ Source of truth (operator scripts, saved to the project 2026-10-03):
+   11. Traditional Valuation table checking   -> checks + 2 repairs + audits
+   12. SPG CHECKING QUERIES                   -> checks + SPG AP backfill
+   13. Update_channel_comm_seperate           -> channel comma -> space (TRAD stmt)
+   14. duplicate_recorD_359                   -> AUDIT TABLES ONLY (359 / 375)
+
+ RULINGS (Sagar, 2026-10-03) -- where this file deviates from the scripts,
+ it is because of these:
+   R1. prems_paid repair: NO product_id filter (script had 136/175). Any row
+       with prems_paid NULL is repaired from azbj_val_ipipp_final; rows that
+       find no ipipp row stay NULL. Row-gated: nothing NULL -> stage is a
+       no-op and we continue.
+   R2. closing-data MINUS ext (script 11 lines 103-162): LOG ONLY. Oracle
+       re-ran azbj_val_trad_proc for these contracts; we write them to an
+       audit table (trad_s12_missing_in_ext) for future reference.
+   R3. ext MINUS closing-data (script 11 lines 183-242): LOG ONLY. These are
+       the contracts Oracle deleted from azbj_val_closing_data. NOT June-
+       specific ids -- the set is DERIVED each run and written to an audit
+       table (trad_s12_closing_delete_candidates). We never delete from
+       closing_data (it is an input snapshot).
+   R4. product_code-NULL rows (script 11 lines 262-264): LOG ONLY into the
+       audit table delete_trad_not (full rows). The physical DELETE is
+       behind APPLY_PRODUCT_CODE_NULL_DELETE (default False per ruling).
+       NOTE -> PARITY: Oracle's June table HAS these rows deleted; with the
+       flag off, our Step-12 output keeps them and the recon/row counts
+       differ by exactly COUNT(delete_trad_not). Flip the flag to match.
+   R5. script 11 lines 300-332 (dup-rowid, extract_type x status, fup_curr
+       NULL, os_adv_inst, 'JL AD'): emitted as separate CSV files for audit.
+   R6. script 14: tables created for audit only -- no deletes in Oracle, so
+       none here. Our B19 fans DISTINCT covers, so both tables are expected
+       EMPTY; non-empty means a Step-11 defect.
+   R7. TRAD has NO surrender-reversal and NO file-length check (confirmed).
+
+ WRITE MODEL (Annuity/UL precedent): read the IMMUTABLE Step-11 table ->
+ write a NEW Step-12 table. Step 11 stays independently reconcilable and
+ the Step11-vs-Step12 diff is the audit trail. Step 14 reads the Step-12
+ output path.
+
+ Failure-topology parity:
+   * Correlated-scalar UPDATEs (prems_paid, SPG AP): >1 source rows per key
+     would be ORA-01427 in Oracle -- the whole statement fails. We RAISE.
+   * TO_NUMBER(booking_frequency) on a non-numeric value would fail the SPG
+     statement in Oracle. We RAISE if a non-NULL bf fails the numeric cast.
+   * A scalar subquery with NO row writes NULL (prems_paid stays NULL; an
+     SPG contract with no top version row goes 0 -> NULL). Replicated as-is.
+
+ External function translated here:
+   azbj_pk0_acc.get_booking_freq(cid) -> VARCHAR2   [source: azbj_pk0_acc.sql]
+     ocp_policy_bases top_indicator='Y' AND action_code<>'D':
+        exactly 1 row  -> booking_frequency
+        0 rows (NDF)   -> wip_policy_bases (NO filters): exactly 1 -> value,
+                          anything else -> NULL
+        >1 rows (TMR)  -> NULL  (WHEN OTHERS)
+=============================================================================
+"""
+
+import logging
+import os
+import time
+
+from pyspark import StorageLevel
+from pyspark.sql import SparkSession, functions as F, types as T
+
+logging.basicConfig(level=logging.INFO,
+                    format="%(asctime)s %(levelname)s %(message)s")
+logger = logging.getLogger("trad_step12")
+
+# Same source-read boundary as Step 11 (translation rules): '' -> NULL on
+# strings and NOTHING else (byte-preserving, never trim); numeric identity
+# keys stored numerically -> cast('long'). Source tables MUST come through
+# this so Step 12 sees them exactly as Step 11 did. Our own Step-11 output
+# is read PLAIN (already normalized at ingest; its target-DDL schema must
+# pass through unchanged).
+NUMERIC_ID_KEYS = {
+    "contract_id", "product_id", "version_no", "object_id", "ip_no",
+    "agent_no", "part_id", "partner_id", "internal_account_id",
+    "add_id", "mailing_address_id", "int_id", "desc_int_id", "prod_id",
+}
+
+
+def read_tbl(spark, path, cast_keys=True):
+    df = spark.read.format("delta").load(path)
+    numeric_types = (T.DecimalType, T.IntegerType, T.LongType, T.ShortType,
+                     T.DoubleType, T.FloatType)
+    for f in df.schema.fields:
+        name = f.name
+        if isinstance(f.dataType, T.StringType):
+            df = df.withColumn(
+                name,
+                F.when(F.col(name) == F.lit(""), F.lit(None))
+                 .otherwise(F.col(name)))
+        elif cast_keys and name.lower() in NUMERIC_ID_KEYS \
+                and isinstance(f.dataType, numeric_types):
+            df = df.withColumn(name, F.col(name).cast("long"))
+    return df
+
+# ---------------------------------------------------------------------------
+# Config -- fill before running (same convention as Step 11: blank = refuse)
+# ---------------------------------------------------------------------------
+PATHS = {
+    "in_trad_step11":        "",   # Step 11 output (out_trad_ext)
+    "azbj_val_closing_data": "",
+    "azbj_val_ipipp_final":  "",   # also one of Step 11's 18 blanks
+    "ocp_policy_versions":   "",
+    "ocp_policy_bases":      "",
+    "wip_policy_bases":      "",
+    "azbj_valuation_product_det": "",  # real TRAD gate for the audits
+    "oracle_june_snapshot":  "",   # post-Step-12 Oracle June table --
+                                   # scopes the Stage-4 delete (see below)
+    "out_trad_step12":       "",   # NEW table this job writes
+    "audit_dir":             "",   # base dir: Delta audit tables + CSVs
+}
+
+# R4 UPDATE 2026-10-12: population recon PROVED the June operator deleted
+# the product_code-NULL rows (38 contracts / 49 rows present in our Step 11,
+# absent from the post-Step-12 snapshot). Flag is now True so our Step-12
+# output matches Oracle's row set; the full rows are still backed up to the
+# delete_trad_not audit table before the delete.
+APPLY_PRODUCT_CODE_NULL_DELETE = True
+
+# Script 11's TRAD product list (first copy -- the fullest; the file's three
+# copies DISAGREE: copy 2 drops 355, copy 3 drifts too. Canonical = copy 1,
+# recorded in claude/trad_step12_review.md).
+TRAD_PRODUCTS = [
+    3, 4, 5, 9, 10, 11, 12, 14, 16, 20, 22, 51, 57, 81, 83, 85, 86, 87, 103,
+    121, 124, 136, 175, 181, 191, 201, 203, 207, 217, 219, 221, 247, 233,
+    227, 241, 249, 257, 259, 261, 253, 277, 279, 281, 271, 275, 287, 289,
+    299, 291, 297, 283, 295, 309, 315, 305, 319, 317, 321, 329, 339, 343,
+    345, 355, 997, 365, 359, 375, 367,
+]
+
+
+def _tick(label, t0):
+    logger.warning("TIMER %-32s %9.1fs", label, time.time() - t0)
+
+
+def write_audit_table(df, name):
+    path = os.path.join(PATHS["audit_dir"], name)
+    df.write.format("delta").mode("overwrite").save(path)
+    n = df.count()
+    logger.info("AUDIT table %-38s rows=%-8d -> %s", name, n, path)
+    return n
+
+
+def write_audit_csv(df, name):
+    path = os.path.join(PATHS["audit_dir"], "csv", name)
+    (df.coalesce(1).write.mode("overwrite")
+       .option("header", "true").csv(path))
+    n = df.count()
+    logger.info("AUDIT csv   %-38s rows=%-8d -> %s", name, n, path)
+    return n
+
+
+# ---------------------------------------------------------------------------
+# azbj_pk0_acc.get_booking_freq -- set-based dim (bf_cid, bf_val)
+# ---------------------------------------------------------------------------
+def booking_freq_dim(ocp_pb, wip_pb):
+    o = (ocp_pb.filter(F.col("top_indicator") == F.lit("Y"))
+               .filter(F.col("action_code") != F.lit("D"))
+               .groupBy("contract_id")
+               .agg(F.count(F.lit(1)).alias("_n"),
+                    F.first("booking_frequency").alias("_v")))
+    w = (wip_pb.groupBy("contract_id")
+               .agg(F.count(F.lit(1)).alias("_wn"),
+                    F.first("booking_frequency").alias("_wv")))
+    return (o.join(w, "contract_id", "full")
+             .select(
+                 F.col("contract_id").alias("bf_cid"),
+                 F.when(F.coalesce(F.col("_n"), F.lit(0)) == 1, F.col("_v"))
+                  .when((F.coalesce(F.col("_n"), F.lit(0)) == 0)
+                        & (F.coalesce(F.col("_wn"), F.lit(0)) == 1),
+                        F.col("_wv"))
+                  .otherwise(F.lit(None)).alias("bf_val")))
+
+
+# ---------------------------------------------------------------------------
+# Stage 1 -- prems_paid repair (script 11 lines 1-22, RULING R1: no product
+# filter). Row-gated: only NULL prems_paid rows change.
+# ---------------------------------------------------------------------------
+def stage1_prems_paid(trad, ipipp):
+    nulls = trad.filter(F.col("prems_paid").isNull())
+    n_null = nulls.count()
+    logger.info("Stage 1: rows with prems_paid NULL: %d%s", n_null,
+                " -- stage is a NO-OP, continuing" if n_null == 0 else "")
+    if n_null == 0:
+        return trad
+
+    src = (ipipp.groupBy("contract_id")
+                .agg(F.count(F.lit(1)).alias("_in"),
+                     F.first("amt").alias("_iamt")))
+    # ORA-01427 parity: >1 ipipp rows for a repaired contract would fail the
+    # Oracle statement outright.
+    bad = (nulls.select("contract_id").distinct()
+                .join(src.filter(F.col("_in") > 1), "contract_id", "inner"))
+    n_bad = bad.count()
+    if n_bad:
+        bad.show(50, truncate=False)
+        raise ValueError(
+            f"Stage 1: {n_bad} contract(s) have >1 azbj_val_ipipp_final "
+            f"row(s) -- Oracle's UPDATE would raise ORA-01427; refusing.")
+
+    out = (trad.join(src.select(F.col("contract_id").alias("_icid"),
+                                "_iamt"),
+                     trad["contract_id"] == F.col("_icid"), "left")
+               .withColumn("prems_paid",
+                           F.when(F.col("prems_paid").isNull(),
+                                  F.col("_iamt"))      # no ipipp row -> NULL
+                            .otherwise(F.col("prems_paid")))
+               .drop("_icid", "_iamt"))
+    logger.info("Stage 1: prems_paid repaired on the %d NULL row(s)", n_null)
+    return out
+
+
+# ---------------------------------------------------------------------------
+# Stage 2 -- SPG (321) annual-premium backfill (script 12).
+#   spg_ip_is = 321 rows with NVL(annual_prem_ps_curr,0)=0  (audit table)
+#   UPDATE ... SET ap = full_term_premium * TO_NUMBER(get_booking_freq) * 100
+#     from ocp_policy_versions top_indicator='Y' (NO action_code filter --
+#     exactly as the script), for ALL rows of those contracts.
+# ---------------------------------------------------------------------------
+def stage2_spg_ap(trad, versions, bf_dim):
+    pop = (trad.filter(F.col("product_id").cast("long") == 321)
+               .filter(F.coalesce(F.col("annual_prem_ps_curr").cast(
+                   "decimal(38,10)"), F.lit(0)) == 0))
+    write_audit_table(
+        pop.select("contract_id", "pol_number", "extract_type",
+                   "annual_prem_ps_curr"), "spg_ip_is")
+    keys = pop.select("contract_id").distinct()
+    n_keys = keys.count()
+    logger.info("Stage 2: SPG contracts with zero/NULL AP: %d%s", n_keys,
+                " -- stage is a NO-OP, continuing" if n_keys == 0 else "")
+    if n_keys == 0:
+        return trad
+
+    top = (versions.filter(F.col("top_indicator") == F.lit("Y"))
+                   .groupBy("contract_id")
+                   .agg(F.count(F.lit(1)).alias("_tn"),
+                        F.first("full_term_premium").alias("_ftp")))
+    bad = keys.join(top.filter(F.col("_tn") > 1), "contract_id", "inner")
+    n_bad = bad.count()
+    if n_bad:
+        bad.show(50, truncate=False)
+        raise ValueError(
+            f"Stage 2: {n_bad} SPG contract(s) have >1 top_indicator='Y' "
+            f"version row(s) -- Oracle's UPDATE would raise ORA-01427; "
+            f"refusing.")
+
+    src = (keys.join(top, "contract_id", "left")
+               .join(bf_dim, F.col("contract_id") == F.col("bf_cid"), "left")
+               .withColumn("_bfnum", F.col("bf_val").cast("decimal(38,10)")))
+    # TO_NUMBER parity: a non-NULL, non-numeric booking_frequency would fail
+    # the Oracle statement.
+    badbf = src.filter(F.col("bf_val").isNotNull()
+                       & F.col("_bfnum").isNull())
+    n_badbf = badbf.count()
+    if n_badbf:
+        badbf.select("contract_id", "bf_val").show(50, truncate=False)
+        raise ValueError(
+            f"Stage 2: {n_badbf} contract(s) have non-numeric "
+            f"booking_frequency -- Oracle's TO_NUMBER would fail; refusing.")
+
+    src = src.select(
+        F.col("contract_id").alias("_scid"),
+        (F.col("_ftp").cast("decimal(38,10)") * F.col("_bfnum")
+         * F.lit(100)).alias("_newap"))     # any NULL input -> NULL (0->NULL)
+    out = (trad.join(src, trad["contract_id"] == F.col("_scid"), "left")
+               .withColumn("annual_prem_ps_curr",
+                           F.when(F.col("_scid").isNotNull(),
+                                  F.col("_newap"))
+                            .otherwise(F.col("annual_prem_ps_curr")))
+               .drop("_scid", "_newap"))
+    logger.info("Stage 2: annual_prem_ps_curr backfilled for %d SPG "
+                "contract(s) (no-top-version contracts go 0 -> NULL, "
+                "matching Oracle)", n_keys)
+    return out
+
+
+# ---------------------------------------------------------------------------
+# Stage 3 -- channel comma -> space (script 13, TRAD statement). Length-
+# preserving; ONLY the channel column, per the scripts' own asymmetry.
+# ---------------------------------------------------------------------------
+def stage3_channel_comma(trad):
+    hit = trad.filter(F.col("channel").isNotNull()
+                      & F.col("channel").rlike(","))
+    n = hit.count()
+    logger.info("Stage 3: channel values containing ',': %d", n)
+    if n == 0:
+        return trad
+    return trad.withColumn(
+        "channel",
+        F.when(F.col("channel").isNotNull() & F.col("channel").rlike(","),
+               F.regexp_replace(F.col("channel"), ",", " "))
+         .otherwise(F.col("channel")))
+
+
+# ---------------------------------------------------------------------------
+# Stage 4 -- product_code-NULL rows (script 11 lines 258-283; RULING R4:
+# log to delete_trad_not, delete only behind the flag).
+# ---------------------------------------------------------------------------
+def stage4_product_code_null(trad, oracle_snapshot):
+    """FIXED 2026-10-12 after the first Step-12 run derived 4,352,173 rows:
+    TRAD legitimately keeps ~4.35M pc-NULL rows -- the June operator's
+    delete was pc-NULL AND his hand-picked id list (38 contracts / 49 rows,
+    proven by the population recon). The June list is derivable as: pc-NULL
+    rows whose CONTRACT IS ABSENT from the post-12 snapshot. For a future
+    month this scoping needs that month's operator list instead (the
+    snapshot trick only works when the compare target already exists)."""
+    is_bad = (F.coalesce(F.col("product_code"), F.lit("NOT"))
+              == F.lit("NOT"))
+    bad_all = trad.filter(is_bad)
+    n_all = bad_all.count()
+    snap_ids = oracle_snapshot.select(
+        F.col("contract_id").cast("decimal(38,10)").alias("contract_id")
+    ).distinct()
+    bad = bad_all.join(snap_ids, "contract_id", "left_anti")
+    n = write_audit_table(bad, "delete_trad_not")
+    logger.info("Stage 4: pc-NULL rows total=%d; June-delete subset "
+                "(contract absent from snapshot)=%d", n_all, n)
+    if n and not APPLY_PRODUCT_CODE_NULL_DELETE:
+        logger.warning("Stage 4: %d row(s) KEPT (flag off) -- expect "
+                       "exactly this row-count gap at recon.", n)
+        return trad
+    if n and APPLY_PRODUCT_CODE_NULL_DELETE:
+        del_ids = [r[0] for r in
+                   bad.select("contract_id").distinct().collect()]
+        logger.info("Stage 4: deleting %d row(s) across %d contract(s) "
+                    "(backup in delete_trad_not)", n, len(del_ids))
+        return trad.filter(~(is_bad
+                             & F.col("contract_id").isin(del_ids)))
+    return trad
+
+
+# ---------------------------------------------------------------------------
+# Audits -- script 11's checks as tables / CSVs (RULINGS R2, R3, R5, R6)
+# ---------------------------------------------------------------------------
+def run_audits(trad, closing, product_det):
+    # 2026-10-15: gate closing_data by product_type='TRAD' from
+    # azbj_valuation_product_det (same gate as Step 11's B0). The hardcoded
+    # script-11 list provably omits real TRAD products (371 etc.) and made
+    # the R3 audit report 57,447 false positives; with the real gate the
+    # verified numbers are R3=0 and R2=43 (incl. the 2 carry-no-prior).
+    trad_pids = (product_det.filter(F.col("product_type") == "TRAD")
+                 .select(F.col("product_id").cast("long").alias("_tp"))
+                 .distinct())
+    cl = closing.join(trad_pids,
+                      F.col("product_id").cast("long") == F.col("_tp"),
+                      "left_semi")
+    cl_ids = cl.select(F.col("contract_id").cast("long")
+                       .alias("contract_id")).distinct()
+    tr_ids = trad.select(F.col("contract_id").cast("long")
+                         .alias("contract_id")).distinct()
+
+    # R2: closing MINUS ext -- Oracle re-ran azbj_val_trad_proc for these.
+    missing = cl_ids.join(tr_ids, "contract_id", "left_anti")
+    n_miss = write_audit_table(missing, "trad_s12_missing_in_ext")
+    if n_miss:
+        logger.warning("R2: %d contract(s) in closing_data but NOT in the "
+                       "extract -- Oracle re-ran azbj_val_trad_proc for "
+                       "these; investigate why Step 11 dropped them "
+                       "(abort counters first).", n_miss)
+        missing.show(50, truncate=False)
+
+    # R3: ext MINUS closing -- the closing-data delete candidates (derived,
+    # never June's hardcoded 4 ids). LOG ONLY.
+    extra = tr_ids.join(cl_ids, "contract_id", "left_anti")
+    n_extra = write_audit_table(extra, "trad_s12_closing_delete_candidates")
+    if n_extra:
+        logger.warning("R3: %d contract(s) in the extract but NOT in "
+                       "closing_data(TRAD products) -- in Oracle these were "
+                       "deleted FROM closing_data. Logged only.", n_extra)
+        extra.show(50, truncate=False)
+
+    # R5 CSVs -------------------------------------------------------------
+    write_audit_csv(
+        trad.groupBy("extract_type")
+            .agg(F.countDistinct("contract_id").alias("distinct_contracts"),
+                 F.count(F.lit(1)).alias("rows")),
+        "counts_by_extract_type")
+    write_audit_csv(
+        trad.groupBy("product_code", "cover_code")
+            .agg(F.count(F.lit(1)).alias("rows"))
+            .orderBy("product_code", "cover_code"),
+        "counts_by_product_cover")
+    write_audit_csv(
+        trad.groupBy("extract_type", "status_code_curr")
+            .agg(F.count(F.lit(1)).alias("rows")),
+        "counts_by_extract_type_status")
+    write_audit_csv(
+        trad.filter(F.col("fup_curr").isNull())
+            .groupBy("extract_type").agg(F.count(F.lit(1)).alias("rows")),
+        "fup_curr_null_by_extract_type")
+    write_audit_csv(
+        trad.filter(F.col("os_adv_inst").isNotNull()),
+        "rows_os_adv_inst_not_null")
+    write_audit_csv(
+        trad.filter(F.col("jl_indicator") == F.lit("JL AD")),
+        "rows_jl_ad")
+    # multi-row contracts (the ROWID dup probe; fan contracts are LEGIT here)
+    write_audit_csv(
+        trad.groupBy("contract_id")
+            .agg(F.count(F.lit(1)).alias("rows"))
+            .filter(F.col("rows") > 1),
+        "contracts_with_multiple_rows")
+    # prem_rec_date / prems_paid population probes (script 11 lines 1-11)
+    write_audit_csv(
+        trad.agg(
+            F.sum(F.when(F.col("prem_rec_date").isNotNull(), 1)
+                   .otherwise(0)).alias("prem_rec_date_not_null"),
+            F.sum(F.when(F.col("prems_paid").isNotNull(), 1)
+                   .otherwise(0)).alias("prems_paid_not_null"),
+            F.count(F.lit(1)).alias("total_rows")),
+        "population_probes")
+
+    # R6: script 14 -- 359/375 duplicate tables (expected EMPTY: our B19
+    # fans DISTINCT covers). Non-empty => Step-11 defect.
+    for pid, name in ((359, "tab_dup_359"), (375, "tab_dup_375")):
+        dup = (trad.filter(F.col("product_id").cast("long") == pid)
+                   .groupBy("contract_id", "cover_code", "product_id")
+                   .agg(F.count(F.lit(1)).alias("rows"))
+                   .filter(F.col("rows") > 1))
+        n = write_audit_table(dup, name)
+        if n:
+            logger.warning(
+                "R6: %s has %d key(s). VERIFIED 2026-10-14: the 6 known 359 "
+                "keys are NULL-cover rows whose row pattern is IDENTICAL in "
+                "Oracle (two NULL-cover rows per contract) -- expected, not "
+                "a defect. A NEW key beyond those should be compared against "
+                "Oracle before alarm.", name, n)
+
+
+# ---------------------------------------------------------------------------
+# =============================================================================
+# Stage 5 -- snapshot substitution (decision 2026-10-15, + fup_curr decision
+# 2026-10-12). Three VINTAGE deviation clusters -- the source tables changed
+# between Oracle's June run and the platform copy, so no rerun can reproduce
+# Oracle's values; per Sagar's ruling the cells are copied from the snapshot:
+#   D-TRAD-12  bonus vintage  (azbj_policy_bonus_details rows added/changed
+#              post-June; get_bonus_det logic verified IDENTICAL to ours)
+#   D-TRAD-13  apd vintage    (azbj_annuity_prod_det top_indicator flipped
+#              to 'N' post-June on ~740 contracts' rows)
+#   D-TRAD-14  ip vintage     (ocp_interested_parties state differed in June
+#              on 79 L135B01 rows)
+# Mechanism: keyed (contract_id, cover_code); wherever OUR value differs
+# null-safely from the snapshot's, take the snapshot's. Rows absent from the
+# snapshot (the 23 ours-only rows) and the 6 duplicate NULL-cover keys are
+# left untouched. Per-column counts go to audit 'snapshot_substitution_counts'
+# -- expect them ~= the recon mismatch counts (fup_curr 355, rev_bonus 4797,
+# vacination_discount 772, ... sex_code_l1 79, ...).
+# =============================================================================
+
+SNAPSHOT_SUBSTITUTION_COLS = [
+    # fup_curr (decision 2026-10-12; recon: 355 rows)
+    "fup_curr",
+    # D-TRAD-12 bonus vintage
+    "rev_bonus_curr", "simple_bonus_curr",
+    # D-TRAD-13 apd vintage
+    "vacination_discount", "salaried_discount",
+    "account_aggregator_discount", "death_ben_instalments",
+    "first_customer", "ib_mult_perc", "frequency", "prime_disc_amt",
+    "ib_partner_mark_markup", "iib_discount", "ib_perc", "gmb_perc",
+    "death_benefit_option", "death_benefit_perc", "salaried_yn",
+    "gmb_partner_mark_markup", "num_of_prem_holidays", "gmb_autopay_markup",
+    "auto_pay_rebate_flag", "worksite_marketing_discount", "vaccinate_flag",
+    "ib_autopay_markup", "gmb_loyalty_markup", "gmb_higher_prem_markup",
+    "gmb_web_markup", "gmb_staff_markup", "deferment_period",
+    "family_benefit_markup", "existing_customer", "multi_option_disc",
+    "ib_higher_prem_markup", "fully_vaccinated_flag", "salaried_rebate_flag",
+    "ib_loyalty_markup", "loyalty_flag", "income_period",
+    # D-TRAD-14 ip vintage (L135B01)
+    "sex_code_l1", "smoker_code_l1", "com_date", "date_of_birth_l1",
+    "agency_code", "rider_di_com_date",
+    # B18b -- snapshot-loaded for the JUNE file only (decision 2026-10-17):
+    # pkg_sb accumulation (ACB/AGMI/AGLS) and getactvalue (SHADOW_VAL) are
+    # blocked on the fund/accum table paths, not on our code. REMOVE these
+    # four the moment the B18b translations land.
+    "acb_amount", "agmi_amount", "agls_amount", "shadow_val",
+]
+
+
+def stage5_snapshot_substitution(trad, snap):
+    t_cols = {c.lower(): c for c in trad.columns}
+    s_cols = {c.lower(): c for c in snap.columns}
+    missing = [c for c in SNAPSHOT_SUBSTITUTION_COLS
+               if c not in t_cols or c not in s_cols]
+    if missing:
+        raise ValueError(f"substitution: column(s) absent on a side: {missing}")
+    s = snap.select(
+        F.col(s_cols["contract_id"]).cast("decimal(38,10)").alias("sb_cid"),
+        F.coalesce(F.col(s_cols["cover_code"]).cast("string"),
+                   F.lit("<NULL>")).alias("sb_cov"),
+        *[F.col(s_cols[c]).alias("sb__" + c)
+          for c in SNAPSHOT_SUBSTITUTION_COLS])
+    dup = (s.groupBy("sb_cid", "sb_cov").agg(F.count(F.lit(1)).alias("_n"))
+             .filter(F.col("_n") > 1).select("sb_cid", "sb_cov"))
+    s = s.join(dup, ["sb_cid", "sb_cov"], "left_anti")
+    j = (trad.withColumn("_sb_cov",
+                         F.coalesce(F.col(t_cols["cover_code"])
+                                    .cast("string"), F.lit("<NULL>")))
+             .join(s, (F.col(t_cols["contract_id"]).cast("decimal(38,10)")
+                       == F.col("sb_cid"))
+                   & (F.col("_sb_cov") == F.col("sb_cov")), "left"))
+    matched = F.col("sb_cid").isNotNull()
+    t_types = {f.name.lower(): f.dataType for f in trad.schema.fields}
+
+    def _differs(c):
+        # DATE-level for timestamp/date columns (2026-10-17): the +05:30
+        # clock-time ingestion artifact is not a value difference -- the
+        # first run logged 9.76M fup_curr / 9.99M com_date cells that were
+        # date-identical. True value fixes there: 355 / 79.
+        ours, snap_c = F.col(t_cols[c]), F.col("sb__" + c)
+        if isinstance(t_types[c], (T.TimestampType, T.DateType)):
+            return matched & ~F.to_date(ours).eqNullSafe(F.to_date(snap_c))
+        return matched & ~ours.eqNullSafe(snap_c)
+
+    aggs = [F.sum(F.when(_differs(c), 1).otherwise(0)).alias(c)
+            for c in SNAPSHOT_SUBSTITUTION_COLS]
+    cnt = j.agg(*aggs).collect()[0].asDict()
+    total = 0
+    for c in SNAPSHOT_SUBSTITUTION_COLS:
+        n = int(cnt[c] or 0)
+        total += n
+        logger.info("substitution %-30s cells=%d", c, n)
+        j = j.withColumn(
+            t_cols[c],
+            F.when(_differs(c), F.col("sb__" + c))
+             .otherwise(F.col(t_cols[c])))
+    logger.warning("Stage 5: snapshot substitution -- %d cells across %d "
+                   "columns (register D-TRAD-12/13/14 + fup_curr)",
+                   total, len(SNAPSHOT_SUBSTITUTION_COLS))
+    spark = trad.sparkSession
+    write_audit_table(
+        spark.createDataFrame([(c, int(cnt[c] or 0))
+                               for c in SNAPSHOT_SUBSTITUTION_COLS],
+                              "column string, substituted_cells long"),
+        "snapshot_substitution_counts")
+    return j.drop("_sb_cov", "sb_cid", "sb_cov",
+                  *["sb__" + c for c in SNAPSHOT_SUBSTITUTION_COLS])
+
+
+def main():
+    blanks = [k for k, v in PATHS.items() if not v]
+    if blanks:
+        raise ValueError(f"PATHS not filled: {blanks}")
+
+    spark = (
+        SparkSession.builder.appName("trad_step12_post_extract")
+        .config("spark.sql.session.timeZone", "Asia/Kolkata")
+        .config("spark.sql.adaptive.enabled", "true")
+        .config("spark.sql.adaptive.coalescePartitions.enabled", "true")
+        .config("spark.network.timeout", "600s")
+        .config("spark.executor.heartbeatInterval", "60s")
+        .getOrCreate()
+    )
+    spark.conf.set("spark.sql.session.timeZone", "Asia/Kolkata")
+    assert spark.conf.get("spark.sql.session.timeZone") == "Asia/Kolkata"
+
+    rd = lambda k: read_tbl(spark, PATHS[k])  # noqa: E731  (source tables)
+
+    t_all = time.time()
+    # our own Step-11 output: PLAIN read -- schema must pass through as-is
+    trad = (spark.read.format("delta").load(PATHS["in_trad_step11"])
+            .persist(StorageLevel.MEMORY_AND_DISK))
+    n_in = trad.count()
+    logger.info("Step-11 input rows: %d", n_in)
+
+    bf_dim = booking_freq_dim(rd("ocp_policy_bases"),
+                              rd("wip_policy_bases"))
+
+    t0 = time.time()
+    trad = stage1_prems_paid(trad, rd("azbj_val_ipipp_final"))
+    _tick("stage 1 prems_paid", t0)
+
+    t0 = time.time()
+    trad = stage2_spg_ap(trad, rd("ocp_policy_versions"), bf_dim)
+    _tick("stage 2 SPG AP backfill", t0)
+
+    t0 = time.time()
+    trad = stage3_channel_comma(trad)
+    _tick("stage 3 channel comma", t0)
+
+    t0 = time.time()
+    trad = stage4_product_code_null(
+        trad,
+        spark.read.format("delta").load(PATHS["oracle_june_snapshot"]))
+    trad = trad.persist(StorageLevel.MEMORY_AND_DISK)
+    n_out = trad.count()
+    _tick("stage 4 product_code audit", t0)
+
+    t0 = time.time()
+    run_audits(trad, rd("azbj_val_closing_data"),
+               rd("azbj_valuation_product_det"))
+    _tick("audits", t0)
+
+    expected = n_in if not APPLY_PRODUCT_CODE_NULL_DELETE else None
+    if expected is not None and n_out != expected:
+        raise ValueError(f"ROW COUNT CHANGED: in={n_in} out={n_out} with "
+                         f"the delete flag OFF -- a repair join fanned out.")
+
+    t0 = time.time()
+    trad = stage5_snapshot_substitution(
+        trad,
+        spark.read.format("delta").load(PATHS["oracle_june_snapshot"]))
+    n_fin = trad.count()
+    if n_fin != n_out:
+        raise ValueError(f"ROW COUNT CHANGED at stage 5: {n_out} -> {n_fin}"
+                         " -- the substitution join fanned out.")
+    _tick("stage 5 snapshot substitution", t0)
+
+    t0 = time.time()
+    (trad.write.format("delta").mode("overwrite")
+         .save(PATHS["out_trad_step12"]))
+    _tick("final write", t0)
+    logger.warning("TRAD Step 12 WRITTEN to %s  rows=%d (in=%d)",
+                   PATHS["out_trad_step12"], n_out, n_in)
+    _tick("TOTAL", t_all)
+
+
+if __name__ == "__main__":
+    main()
+	
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+"""
+=============================================================================
+ TRAD end-state COLUMN RECON  --  our Step-12 output vs Oracle June snapshot
+=============================================================================
+
+ One pass over all 411 columns. Output: ONE summary table (per column:
+ matches, mismatches, null-direction splits, bucket annotation) + a samples
+ table (up to 5 mismatching rows per column) under RECON_OUT.
+
+ Grain: (contract_id, cover_code). Keys that are non-unique on either side
+ (the 359 NULL-cover duplicates etc.) are COUNTED and SET ASIDE -- value
+ comparison on an ambiguous key is meaningless; they are few and listed.
+
+ Comparison rules (both tables share the target DDL, so types align):
+   timestamps  -> compared at DATE level (E4: the platform copy carries
+                  +05:30 / time-part artifacts; Oracle semantics are DATE)
+   decimals    -> compared as decimal(38,10)
+   strings     -> exact, null-safe
+ All comparisons eqNullSafe: NULL==NULL counts as a match.
+
+ Pre-declared buckets (annotation only -- numbers are still reported):
+   SUBSTITUTION   hni_flag, angioplasty_flag (+ fup_curr decision 2026-10-12:
+                  will be snapshot-copied -- treat its mismatches as the
+                  patch set, not defects)
+   B18B_EXCLUDED  acb_amount, agmi_amount, agls_amount, shadow_val --
+                  expected mismatch until the fund/accum table paths arrive
+   NOT_PRODUCED   the 38 proc-never-assigned columns -- expect NULL==NULL
+   DEVIATION_ROWS a column may mismatch on ~<=1,500 counted deviation rows
+                  (D-TRAD-1/2/3/6/9/10) -- compare its mismatch count to
+                  the counters before calling it a defect.
+=============================================================================
+"""
+
+import logging
+import os
+import time
+
+from pyspark import StorageLevel
+from pyspark.sql import SparkSession, functions as F, types as T
+
+logging.basicConfig(level=logging.INFO,
+                    format="%(asctime)s %(levelname)s %(message)s")
+logger = logging.getLogger("trad_recon")
+
+OURS_PATH   = ""   # Step-12 output (out_trad_step12)
+ORACLE_PATH = ""   # Oracle June snapshot (post-Step-12)
+RECON_OUT   = ""   # output dir: summary + samples + dup-key lists
+
+# D-TRAD-11: ours-only contracts (Oracle June failures) -- excluded from the
+# join so they don't pollute per-column counts; they are already registered.
+DTRAD11_IDS = [68592998, 67954789, 67927456, 68598247]
+
+KEY = ["contract_id", "cover_code"]
+
+SUBSTITUTION  = {"hni_flag", "angioplasty_flag", "fup_curr",
+                 # Step-12 stage-5 snapshot substitution (2026-10-15):
+                 # D-TRAD-12 bonus / D-TRAD-13 apd / D-TRAD-14 ip vintage.
+                 # After stage 5 these must recon to 0.
+                 "rev_bonus_curr", "simple_bonus_curr",
+                 "vacination_discount", "salaried_discount",
+                 "account_aggregator_discount", "death_ben_instalments",
+                 "first_customer", "ib_mult_perc", "frequency",
+                 "prime_disc_amt", "ib_partner_mark_markup", "iib_discount",
+                 "ib_perc", "gmb_perc", "death_benefit_option",
+                 "death_benefit_perc", "salaried_yn",
+                 "gmb_partner_mark_markup", "num_of_prem_holidays",
+                 "gmb_autopay_markup", "auto_pay_rebate_flag",
+                 "worksite_marketing_discount", "vaccinate_flag",
+                 "ib_autopay_markup", "gmb_loyalty_markup",
+                 "gmb_higher_prem_markup", "gmb_web_markup",
+                 "gmb_staff_markup", "deferment_period",
+                 "family_benefit_markup", "existing_customer",
+                 "multi_option_disc", "ib_higher_prem_markup",
+                 "fully_vaccinated_flag", "salaried_rebate_flag",
+                 "ib_loyalty_markup", "loyalty_flag", "income_period",
+                 "sex_code_l1", "smoker_code_l1", "com_date",
+                 "date_of_birth_l1", "agency_code", "rider_di_com_date",
+                 # B18b: snapshot-loaded at Step-12 stage 5 for the June
+                 # file (2026-10-17); restore to B18B_EXCLUDED when the
+                 # fund/accum translations land.
+                 "acb_amount", "agmi_amount", "agls_amount", "shadow_val"}
+B18B_EXCLUDED = set()   # emptied 2026-10-17: the four columns moved to
+                        # SUBSTITUTION (Step-12 stage 5 snapshot load for
+                        # the June file; restore here when B18b lands)
+NOT_PRODUCED  = {c.lower() for c in [
+    "LIFE_CLASS", "REINSURANCE_CODE", "REINSURANCE_SA", "REINSURANCE_PREM",
+    "ANNUITY_AMOUNT_CURR", "ANNUITY_MODE_CURR", "EMR_L1_H", "EMR_L2_H",
+    "ANNUITY_AMOUNT_PREV_Y", "ANNUITY_MODE_PREV_Y", "ANNUITY_AMOUNT_PREV_M",
+    "ANNUITY_MODE_PREV_M", "RIDER_CI_EXTRA_PREM", "RIDER_CI_EMR",
+    "RIDER_SD_EXTRA_PREM", "RIDER_SD_EMR", "RIDER_HC_EXTRA_PREM",
+    "RIDER_HC_EMR", "RIDER_CW_EXTRA_PREM", "RIDER_CW_EMR",
+    "RIDER_SL_EXTRA_PREM", "RIDER_SL_EMR", "RIDER_MG_EXTRA_PREM",
+    "RIDER_MG_EMR", "RIDER_MC_EXTRA_PREM", "RIDER_MC_EMR", "RIDER_HB_EMR",
+    "RIDER_HS_EMR", "RIDER_HP_EMR", "ANNUITY_AMOUNT", "INIT_POLS_WOP",
+    "PARENT_1_LIFE_STATUS", "PARENT_2_LIFE_STATUS", "SPOUSE_LIFE_STATUS",
+    "BONUS_RATE", "SOLUTION_ID", "COMBO_PRODUCT_CODE", "CHANNEL_FLAG",
+]}
+
+CHUNK = 40           # columns per aggregation job (keeps expression trees
+                     # small -- lesson of the B17 driver OOM)
+SAMPLES_PER_COL = 5
+MAX_SAMPLED_COLS = 80
+
+
+def bucket_of(col):
+    c = col.lower()
+    if c in SUBSTITUTION:
+        return "SUBSTITUTION"
+    if c in B18B_EXCLUDED:
+        return "B18B_EXCLUDED"
+    if c in NOT_PRODUCED:
+        return "NOT_PRODUCED"
+    return ""
+
+
+def cmp_expr(col, dtype):
+    """Null-safe equality with the E4/date + decimal rules."""
+    o, r = F.col(f"o_{col}"), F.col(f"r_{col}")
+    if isinstance(dtype, T.TimestampType) or isinstance(dtype, T.DateType):
+        return F.to_date(o).eqNullSafe(F.to_date(r))
+    if isinstance(dtype, (T.DecimalType, T.DoubleType, T.FloatType)):
+        return o.cast("decimal(38,10)").eqNullSafe(r.cast("decimal(38,10)"))
+    return o.eqNullSafe(r)
+
+
+def main():
+    for n, v in (("OURS_PATH", OURS_PATH), ("ORACLE_PATH", ORACLE_PATH),
+                 ("RECON_OUT", RECON_OUT)):
+        if not v:
+            raise ValueError(f"{n} not set")
+
+    spark = (SparkSession.builder.appName("trad_column_recon")
+             .config("spark.sql.session.timeZone", "Asia/Kolkata")
+             .config("spark.sql.adaptive.enabled", "true")
+             .config("spark.network.timeout", "600s")
+             .config("spark.executor.heartbeatInterval", "60s")
+             .config("spark.driver.maxResultSize", "4g")
+             .getOrCreate())
+    spark.conf.set("spark.sql.session.timeZone", "Asia/Kolkata")
+
+    t_all = time.time()
+    ours = spark.read.format("delta").load(OURS_PATH) \
+        .filter(~F.col("contract_id").cast("long").isin(DTRAD11_IDS))
+    ora = spark.read.format("delta").load(ORACLE_PATH)
+
+    # case-insensitive common columns, DDL order from ours
+    ora_cols = {c.lower(): c for c in ora.columns}
+    cols = [c for c in ours.columns
+            if c.lower() in ora_cols and c.lower() not in
+            [k.lower() for k in KEY]]
+    dtypes = {f.name: f.dataType for f in ours.schema.fields}
+    logger.info("comparing %d columns at grain %s", len(cols), KEY)
+
+    def keyed(df, cmap, prefix):
+        return df.select(
+            F.col(cmap.get("contract_id", "contract_id"))
+             .cast("decimal(38,10)").alias("k_cid"),
+            F.coalesce(F.col(cmap.get("cover_code", "cover_code"))
+                       .cast("string"), F.lit("<NULL>")).alias("k_cov"),
+            *[F.col(cmap.get(c.lower(), c)).alias(prefix + c)
+              for c in cols])
+
+    # ---- split off non-unique keys on each side ----
+    def uniq(df, cmap, prefix):
+        d = keyed(df, cmap, prefix)
+        n = d.groupBy("k_cid", "k_cov").agg(F.count(F.lit(1)).alias("_n"))
+        dups = n.filter(F.col("_n") > 1)
+        d1 = d.join(dups.select("k_cid", "k_cov"), ["k_cid", "k_cov"],
+                    "left_anti")
+        return d1, dups
+
+    ours_u, ours_dup = uniq(ours, {c.lower(): c for c in ours.columns}, "r_")
+    ora_u,  ora_dup  = uniq(ora, ora_cols, "o_")
+    n_od, n_rd = ora_dup.count(), ours_dup.count()
+    logger.warning("non-unique keys set aside: ours=%d oracle=%d "
+                   "(saved to RECON_OUT/dup_keys_*)", n_rd, n_od)
+    ours_dup.write.format("delta").mode("overwrite") \
+        .save(os.path.join(RECON_OUT, "dup_keys_ours"))
+    ora_dup.write.format("delta").mode("overwrite") \
+        .save(os.path.join(RECON_OUT, "dup_keys_oracle"))
+
+    j = (ours_u.join(ora_u, ["k_cid", "k_cov"], "inner")
+         .persist(StorageLevel.DISK_ONLY))
+    n_j = j.count()
+    logger.info("joined unique-key rows: %d", n_j)
+
+    # ---- chunked aggregation: 4 stats per column ----
+    rows = []
+    for i in range(0, len(cols), CHUNK):
+        t0 = time.time()
+        chunk = cols[i:i + CHUNK]
+        aggs = []
+        for c in chunk:
+            eq = cmp_expr(c, dtypes[c])
+            on, rn = F.col(f"o_{c}").isNull(), F.col(f"r_{c}").isNull()
+            aggs += [
+                F.sum(F.when(~eq, 1).otherwise(0)).alias(f"mm__{c}"),
+                F.sum(F.when(rn & ~on, 1).otherwise(0)).alias(f"rn__{c}"),
+                F.sum(F.when(on & ~rn, 1).otherwise(0)).alias(f"on__{c}"),
+                F.sum(F.when(on & rn, 1).otherwise(0)).alias(f"bn__{c}"),
+            ]
+        r = j.agg(*aggs).collect()[0].asDict()
+        for c in chunk:
+            rows.append((c, bucket_of(c), n_j,
+                         int(r[f"mm__{c}"] or 0),
+                         int(r[f"rn__{c}"] or 0), int(r[f"on__{c}"] or 0),
+                         int(r[f"bn__{c}"] or 0)))
+        logger.warning("TIMER chunk %3d-%3d %38s %7.1fs",
+                       i, i + len(chunk) - 1, "", time.time() - t0)
+
+    summary = spark.createDataFrame(
+        rows, "column string, bucket string, rows_compared long, "
+              "mismatches long, ours_null_oracle_value long, "
+              "oracle_null_ours_value long, both_null long") \
+        .withColumn("matches", F.col("rows_compared") - F.col("mismatches")) \
+        .orderBy(F.desc("mismatches"))
+    (summary.coalesce(1).write.mode("overwrite").option("header", "true")
+        .csv(os.path.join(RECON_OUT, "summary_csv")))
+    summary.write.format("delta").mode("overwrite") \
+        .save(os.path.join(RECON_OUT, "summary"))
+    logger.warning("SUMMARY written. Columns with mismatches: %d",
+                   summary.filter(F.col("mismatches") > 0).count())
+    summary.filter(F.col("mismatches") > 0).show(100, truncate=False)
+
+    # ---- samples for mismatching columns ----
+    bad_cols = [r["column"] for r in
+                summary.filter(F.col("mismatches") > 0)
+                       .orderBy(F.desc("mismatches")).collect()]
+    bad_cols = bad_cols[:MAX_SAMPLED_COLS]
+    out = []
+    for c in bad_cols:
+        eq = cmp_expr(c, dtypes[c])
+        s = (j.filter(~eq)
+              .select(F.col("k_cid").cast("string").alias("contract_id"),
+                      F.col("k_cov").alias("cover_code"),
+                      F.lit(c).alias("column"),
+                      F.col(f"r_{c}").cast("string").alias("ours"),
+                      F.col(f"o_{c}").cast("string").alias("oracle"))
+              .limit(SAMPLES_PER_COL))
+        out.append(s)
+    if out:
+        samples = out[0]
+        for s in out[1:]:
+            samples = samples.unionByName(s)
+        (samples.coalesce(1).write.mode("overwrite")
+            .option("header", "true")
+            .csv(os.path.join(RECON_OUT, "samples_csv")))
+        logger.warning("samples written for %d column(s)", len(bad_cols))
+
+    j.unpersist()
+    logger.warning("RECON DONE in %.1fs", time.time() - t_all)
+
+
+if __name__ == "__main__":
+    main()
+
+
+
+
+
+
+
+
