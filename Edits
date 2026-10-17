@@ -1,0 +1,24 @@
+    # B18b -- snapshot-loaded for the JUNE file only (decision 2026-10-17):
+    ...
+    "acb_amount", "agmi_amount", "agls_amount", "shadow_val",
+    # Residual recon columns (decision 2026-10-18, June close-out): the
+    # paid_up/render CODE fixes live in Step 11 and wait for the deferred
+    # rerun; until then the June values come from the snapshot. REVISIT at
+    # the post-feedback Step-11 rerun.
+    "annuity_frequency",        # 1,144,092  string render '1.0000000000'
+    "paid_up_sa_curr",          #   306,422  quotient-scale regression
+    "cust_init_sales_markup",   #   102,451  string render '0E-10'
+    "special_bonus_2021",       #     5,862  bonus vintage residue
+    "special_bonus",            #     5,780  bonus vintage residue
+    "account_val",              #     2,474  fund-family vintage
+    "annual_prem_ps_curr",      #       186  JL booking-freq vintage
+    "rider_wp_sa",              #       115  L007A01 vintage
+    "date_of_mode_chage",       #        77  D-TRAD-14 B13 echo
+    "basic_ap",                 #        64  precision + 1 GSSK vintage row
+    "product_code",             #        35  LSN boundary-day rows + GSSK
+    "aamv",                     #        29  D-TRAD-1 cursor multiplicity
+    "loan_tenure",              #         7  D-TRAD-6 family
+    "loan_amount",              #         5  D-TRAD-6 family
+    "ph_dob",                   #         1
+    "ph_sex",                   #         1
+]
