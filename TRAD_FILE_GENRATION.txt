@@ -1,0 +1,1014 @@
+# =============================================================================
+#  STEP 13/14 -- TRAD FILE GENERATION
+#
+#  PySpark translation of AZBJ_VALUATION_FILE_GEN_PKG (June-2026 version):
+#      PROCEDURE trad_file  -> generate_trad_file()   378 fields  VAL_TRAD_<m>.TXT
+#      PROCEDURE spg_file   -> generate_spg_file()    274 fields  VAL_SPG_<m>.TXT
+#  (trad_csc_file and ace_file are COMMENTED OUT in all_files -- not generated,
+#   matching the June run. Products 275/291 and the group products therefore
+#   reach NO file, exactly as in Oracle.)
+#
+#  Built on the proven conventions of Annuity_File_Gen.py / ul_file_gen.py
+#  (file_generation_spec.md rules R1-R6): explicit coalesce-concat (never
+#  concat_ws), byte-verbatim strings (never trim), oracle_num_to_str (never
+#  cast-to-string), dd/MM/yyyy dates in an Asia/Kolkata session, one file via
+#  staging + rename, structural preflight before writing.
+#
+#  TRAD-SPECIFIC FACTS, all read off the package source:
+#   * Field order comes from the V_LINE CONCATENATION, not the cursor SELECT.
+#     They differ once: the cursor selects ...basic_sa, branch_code,
+#     os_adv_inst, date_last_adv_due... but v_line emits branch_code,
+#     DATE_LAST_ADV_DUE, OS_ADV_INST (swapped). The lists below follow v_line.
+#   * The last two emitted fields (COMBO_PRODUCT_CODE, SOLUTION_ID -- call
+#     51247) are MISSING from the cursor SELECT in the source copy we were
+#     given; the compiled production version must select them. Both are
+#     NOT_PRODUCED (always NULL) -> two empty trailing fields.
+#   * BONUS_RATE is computed AT FILE TIME: a scalar subquery on
+#     AZBJ_BONUS_RATES (bonus_type='OTB', bonus_from_date=01-APR-2025,
+#     product_id IN (329,359), cover_code IN ('RP10A01','L182A01','L182B01')),
+#     gated on the ROW's com_date <= 31-Mar-2025. Date comparisons are done at
+#     DATE level (the platform copy carries the +05:30 shift). A key with >1
+#     rates rows would be ORA-01427 in Oracle (file aborts) -> we raise.
+#   * CASE transforms: salaried_yn / prime_disc_flag YES->Y, NO->N, else
+#     UPPER; income_frequency_type = 'AD' else NULL.
+#   * Aliases: channel_code<-irda_code, age_proof<-st_nst_flag,
+#     ib_amount<-annuity_amount, ib_frequency<-annuity_frequency.
+#   * ROUND(x) is Oracle half-away-from-zero, 0 dp == Spark F.round(x, 0).
+#   * JUNE EXCLUSIONS: the 12 registered ours-only contracts (4 D-TRAD-11 +
+#     8 recovered pc) do not exist in Oracle's June table, so they must not
+#     reach the June files. Flag-gated; OFF for any non-June run.
+#   * No ORDER BY in the cursors (parallel 20): row order is not part of the
+#     contract. Compare with verify_txt_vs_oracle.py (sorted).
+# =============================================================================
+
+import logging
+
+from pyspark.sql import SparkSession
+from pyspark.sql import functions as F
+from pyspark.sql import types as T
+
+logging.basicConfig(level=logging.INFO,
+                    format="%(asctime)s [%(levelname)s] %(message)s")
+logger = logging.getLogger("trad_file_gen")
+
+# -----------------------------------------------------------------------------
+# Config
+# -----------------------------------------------------------------------------
+SRC_PATH         = ""   # the SIGNED-OFF Step-12 table (AZBJ_VAL_TRAD_S12)
+BONUS_RATES_PATH = ""   # azbj_bonus_rates -- REQUIRED (BONUS_RATE field)
+FILE_DIR         = ""   # where the .TXT files land
+
+P_MONTH  = "JUN2026"    # file-name suffix, as the Oracle job is invoked
+LINE_SEP = "\n"         # confirm with the DCS handoff owner ("\n" or "\r\n")
+
+# trad_file's own product exclusion, verbatim from the June package: the
+# group/master-policy products + the fund products of the disabled CSC file.
+TRAD_EXCLUDE_PRODUCTS = [121, 191, 124, 181, 247, 233, 275, 291, 295, 305, 371]
+
+SPG_PRODUCT_IDS = [321]
+
+# June-only: contracts absent from Oracle's June table (register D-TRAD-11 +
+# the 8 band-fix-recovered contracts). OFF for any non-June run.
+APPLY_JUNE_EXCLUSIONS = True
+JUNE_EXCLUDE_IDS = [
+    68592998, 67954789, 67927456, 68598247,            # D-TRAD-11
+    67956396, 67954718, 67954110, 67953437,            # recovered pc
+    67954680, 67727173, 67954055, 68571688,
+]
+
+STRICT = True
+
+
+# =============================================================================
+# Field lists -- ORDER IS THE CONTRACT (v_line order). Do not sort, do not
+# tidy. (name, kind, source_column); kind: raw | round | date | case_yn |
+# case_ad | bonus_rate. Generated mechanically from the June package source.
+# =============================================================================
+
+TRAD_FIELDS = [
+    ("RECORD_TYPE", "raw", "RECORD_TYPE"),  # 1
+    ("PARTNER_ID", "raw", "PARTNER_ID"),  # 2
+    ("POL_NUMBER", "raw", "POL_NUMBER"),  # 3
+    ("SOURCE_CODE", "raw", "SOURCE_CODE"),  # 4
+    ("AGENCY_CODE", "raw", "AGENCY_CODE"),  # 5
+    ("CONTRACT_ID", "raw", "CONTRACT_ID"),  # 6
+    ("JOINT_LIFE_INDICATOR", "raw", "JOINT_LIFE_INDICATOR"),  # 7
+    ("SEX_CODE_L1", "raw", "SEX_CODE_L1"),  # 8
+    ("SEX_CODE_L2", "raw", "SEX_CODE_L2"),  # 9
+    ("SMOKER_CODE_L1", "raw", "SMOKER_CODE_L1"),  # 10
+    ("SMOKER_CODE_L2", "raw", "SMOKER_CODE_L2"),  # 11
+    ("ENTRY_DATE", "date", "ENTRY_DATE"),  # 12
+    ("COM_DATE", "date", "COM_DATE"),  # 13
+    ("DATE_OF_BIRTH_L1", "date", "DATE_OF_BIRTH_L1"),  # 14
+    ("DATE_OF_BIRTH_L2", "date", "DATE_OF_BIRTH_L2"),  # 15
+    ("UW_CLASS", "raw", "UW_CLASS"),  # 16
+    ("LIFE_CLASS", "raw", "LIFE_CLASS"),  # 17
+    ("STATUS_CODE_CURR", "raw", "STATUS_CODE_CURR"),  # 18
+    ("FUP_CURR", "date", "FUP_CURR"),  # 19
+    ("POL_TERM_Y", "round", "POL_TERM_Y"),  # 20
+    ("PREM_PAYMT_TERM", "round", "PREM_PAYMT_TERM"),  # 21
+    ("PREM_PAYMT_MODE", "raw", "PREM_PAYMT_MODE"),  # 22
+    ("SUM_ASSURED_CURR", "round", "SUM_ASSURED_CURR"),  # 23
+    ("PAID_UP_SA_CURR", "round", "PAID_UP_SA_CURR"),  # 24
+    ("ANNUAL_PREM_PS_CURR", "round", "ANNUAL_PREM_PS_CURR"),  # 25
+    ("REV_BONUS_CURR", "round", "REV_BONUS_CURR"),  # 26
+    ("SIMPLE_BONUS_CURR", "round", "SIMPLE_BONUS_CURR"),  # 27
+    ("ANNUITY_AMOUNT_CURR", "round", "ANNUITY_AMOUNT_CURR"),  # 28
+    ("ANNUITY_MODE_CURR", "raw", "ANNUITY_MODE_CURR"),  # 29
+    ("EXTRA_PREM_L1_H", "round", "EXTRA_PREM_L1_H"),  # 30
+    ("EMR_L1_H", "round", "EMR_L1_H"),  # 31
+    ("EXTRA_PREM_L1_O", "round", "EXTRA_PREM_L1_O"),  # 32
+    ("EXTRA_PREM_L1_A", "round", "EXTRA_PREM_L1_A"),  # 33
+    ("EXTRA_PREM_L2_H", "round", "EXTRA_PREM_L2_H"),  # 34
+    ("EMR_L2_H", "round", "EMR_L2_H"),  # 35
+    ("EXTRA_PREM_L2_O", "round", "EXTRA_PREM_L2_O"),  # 36
+    ("EXTRA_PREM_L2_A", "round", "EXTRA_PREM_L2_A"),  # 37
+    ("EXIT_DATE_CURR", "date", "EXIT_DATE_CURR"),  # 38
+    ("MODE_OF_EXIT", "raw", "MODE_OF_EXIT"),  # 39
+    ("STATUS_CODE_PREV_Y", "raw", "STATUS_CODE_PREV_Y"),  # 40
+    ("FUP_PREV_Y", "date", "FUP_PREV_Y"),  # 41
+    ("SUM_ASSURED_PREV_Y", "round", "SUM_ASSURED_PREV_Y"),  # 42
+    ("PAID_UP_SA_PREV_Y", "round", "PAID_UP_SA_PREV_Y"),  # 43
+    ("ANNUAL_PREM_PS_PREV_Y", "round", "ANNUAL_PREM_PS_PREV_Y"),  # 44
+    ("REV_BONUS_PREV_Y", "round", "REV_BONUS_PREV_Y"),  # 45
+    ("SIMPLE_BONUS_PREV_Y", "round", "SIMPLE_BONUS_PREV_Y"),  # 46
+    ("ANNUITY_AMOUNT_PREV_Y", "round", "ANNUITY_AMOUNT_PREV_Y"),  # 47
+    ("ANNUITY_MODE_PREV_Y", "raw", "ANNUITY_MODE_PREV_Y"),  # 48
+    ("EXIT_DATE_PREV_Y", "date", "EXIT_DATE_PREV_Y"),  # 49
+    ("STATUS_CODE_PREV_M", "raw", "STATUS_CODE_PREV_M"),  # 50
+    ("FUP_PREV_M", "date", "FUP_PREV_M"),  # 51
+    ("SUM_ASSURED_PREV_M", "round", "SUM_ASSURED_PREV_M"),  # 52
+    ("PAID_UP_SA_PREV_M", "round", "PAID_UP_SA_PREV_M"),  # 53
+    ("ANNUAL_PREM_PS_PREV_M", "round", "ANNUAL_PREM_PS_PREV_M"),  # 54
+    ("REV_BONUS_PREV_M", "round", "REV_BONUS_PREV_M"),  # 55
+    ("SIMPLE_BONUS_PREV_M", "round", "SIMPLE_BONUS_PREV_M"),  # 56
+    ("ANNUITY_AMOUNT_PREV_M", "round", "ANNUITY_AMOUNT_PREV_M"),  # 57
+    ("ANNUITY_MODE_PREV_M", "raw", "ANNUITY_MODE_PREV_M"),  # 58
+    ("EXIT_DATE_PREV_M", "date", "EXIT_DATE_PREV_M"),  # 59
+    ("RIDER_AD_FLAG", "raw", "RIDER_AD_FLAG"),  # 60
+    ("RIDER_AD_SA", "round", "RIDER_AD_SA"),  # 61
+    ("RIDER_AD_ANN_PREM", "round", "RIDER_AD_ANN_PREM"),  # 62
+    ("RIDER_AD_COM_DATE", "date", "RIDER_AD_COM_DATE"),  # 63
+    ("RIDER_AD_TERM", "round", "RIDER_AD_TERM"),  # 64
+    ("RIDER_CI_FLAG", "raw", "RIDER_CI_FLAG"),  # 65
+    ("RIDER_CI_SA", "round", "RIDER_CI_SA"),  # 66
+    ("RIDER_CI_ANN_PREM", "round", "RIDER_CI_ANN_PREM"),  # 67
+    ("RIDER_CI_EXTRA_PREM_ML", "round", "RIDER_CI_EXTRA_PREM_ML"),  # 68
+    ("RIDER_CI_EXTRA_PREM_OC", "round", "RIDER_CI_EXTRA_PREM_OC"),  # 69
+    ("RIDER_CI_EXTRA_PREM_SR", "round", "RIDER_CI_EXTRA_PREM_SR"),  # 70
+    ("RIDER_CI_EMR_ML", "round", "RIDER_CI_EMR_ML"),  # 71
+    ("RIDER_CI_EMR_OC", "round", "RIDER_CI_EMR_OC"),  # 72
+    ("RIDER_CI_EMR_SR", "round", "RIDER_CI_EMR_SR"),  # 73
+    ("RIDER_CI_COM_DATE", "date", "RIDER_CI_COM_DATE"),  # 74
+    ("RIDER_CI_TERM", "round", "RIDER_CI_TERM"),  # 75
+    ("RIDER_DI_FLAG", "raw", "RIDER_DI_FLAG"),  # 76
+    ("RIDER_DI_SA", "round", "RIDER_DI_SA"),  # 77
+    ("RIDER_DI_ANN_PREM", "round", "RIDER_DI_ANN_PREM"),  # 78
+    ("RIDER_DI_COM_DATE", "date", "RIDER_DI_COM_DATE"),  # 79
+    ("RIDER_DI_TERM", "raw", "RIDER_DI_TERM"),  # 80
+    ("RIDER_SD_FLAG", "raw", "RIDER_SD_FLAG"),  # 81
+    ("RIDER_SD_SA", "round", "RIDER_SD_SA"),  # 82
+    ("RIDER_SD_ANN_PREM", "round", "RIDER_SD_ANN_PREM"),  # 83
+    ("RIDER_SD_EXTRA_PREM_ML", "round", "RIDER_SD_EXTRA_PREM_ML"),  # 84
+    ("RIDER_SD_EXTRA_PREM_OC", "round", "RIDER_SD_EXTRA_PREM_OC"),  # 85
+    ("RIDER_SD_EXTRA_PREM_SR", "round", "RIDER_SD_EXTRA_PREM_SR"),  # 86
+    ("RIDER_SD_EMR_ML", "round", "RIDER_SD_EMR_ML"),  # 87
+    ("RIDER_SD_EMR_OC", "round", "RIDER_SD_EMR_OC"),  # 88
+    ("RIDER_SD_EMR_SR", "round", "RIDER_SD_EMR_SR"),  # 89
+    ("RIDER_SD_COM_DATE", "date", "RIDER_SD_COM_DATE"),  # 90
+    ("RIDER_SD_TERM", "round", "RIDER_SD_TERM"),  # 91
+    ("RIDER_HC_FLAG", "raw", "RIDER_HC_FLAG"),  # 92
+    ("RIDER_HC_SA", "round", "RIDER_HC_SA"),  # 93
+    ("RIDER_HC_ANN_PREM", "round", "RIDER_HC_ANN_PREM"),  # 94
+    ("RIDER_HC_EXTRA_PREM_ML", "round", "RIDER_HC_EXTRA_PREM_ML"),  # 95
+    ("RIDER_HC_EXTRA_PREM_OC", "round", "RIDER_HC_EXTRA_PREM_OC"),  # 96
+    ("RIDER_HC_EXTRA_PREM_SR", "round", "RIDER_HC_EXTRA_PREM_SR"),  # 97
+    ("RIDER_HC_EMR_ML", "round", "RIDER_HC_EMR_ML"),  # 98
+    ("RIDER_HC_EMR_OC", "round", "RIDER_HC_EMR_OC"),  # 99
+    ("RIDER_HC_EMR_SR", "round", "RIDER_HC_EMR_SR"),  # 100
+    ("RIDER_HC_COM_DATE", "date", "RIDER_HC_COM_DATE"),  # 101
+    ("RIDER_HC_TERM", "round", "RIDER_HC_TERM"),  # 102
+    ("RIDER_WP_FLAG", "raw", "RIDER_WP_FLAG"),  # 103
+    ("RIDER_WP_SA", "round", "RIDER_WP_SA"),  # 104
+    ("RIDER_WP_ANN_PREM", "round", "RIDER_WP_ANN_PREM"),  # 105
+    ("RIDER_WP_COM_DATE", "date", "RIDER_WP_COM_DATE"),  # 106
+    ("RIDER_WP_TERM", "round", "RIDER_WP_TERM"),  # 107
+    ("RIDER_CW_FLAG", "raw", "RIDER_CW_FLAG"),  # 108
+    ("RIDER_CW_SA", "round", "RIDER_CW_SA"),  # 109
+    ("RIDER_CW_ANN_PREM", "round", "RIDER_CW_ANN_PREM"),  # 110
+    ("RIDER_CW_EXTRA_PREM_ML", "round", "RIDER_CW_EXTRA_PREM_ML"),  # 111
+    ("RIDER_CW_EXTRA_PREM_OC", "round", "RIDER_CW_EXTRA_PREM_OC"),  # 112
+    ("RIDER_CW_EXTRA_PREM_SR", "round", "RIDER_CW_EXTRA_PREM_SR"),  # 113
+    ("RIDER_CW_EMR_ML", "round", "RIDER_CW_EMR_ML"),  # 114
+    ("RIDER_CW_EMR_OC", "round", "RIDER_CW_EMR_OC"),  # 115
+    ("RIDER_CW_EMR_SR", "round", "RIDER_CW_EMR_SR"),  # 116
+    ("RIDER_CW_COM_DATE", "date", "RIDER_CW_COM_DATE"),  # 117
+    ("RIDER_CW_TERM", "round", "RIDER_CW_TERM"),  # 118
+    ("RIDER_SL_FLAG", "raw", "RIDER_SL_FLAG"),  # 119
+    ("RIDER_SL_SA", "round", "RIDER_SL_SA"),  # 120
+    ("RIDER_SL_ANN_PREM", "round", "RIDER_SL_ANN_PREM"),  # 121
+    ("RIDER_SL_EXTRA_PREM_ML", "round", "RIDER_SL_EXTRA_PREM_ML"),  # 122
+    ("RIDER_SL_EXTRA_PREM_OC", "round", "RIDER_SL_EXTRA_PREM_OC"),  # 123
+    ("RIDER_SL_EXTRA_PREM_SR", "round", "RIDER_SL_EXTRA_PREM_SR"),  # 124
+    ("RIDER_SL_EMR_ML", "round", "RIDER_SL_EMR_ML"),  # 125
+    ("RIDER_SL_EMR_OC", "round", "RIDER_SL_EMR_OC"),  # 126
+    ("RIDER_SL_EMR_SR", "round", "RIDER_SL_EMR_SR"),  # 127
+    ("RIDER_SL_COM_DATE", "date", "RIDER_SL_COM_DATE"),  # 128
+    ("RIDER_SL_ANN_TERM", "round", "RIDER_SL_ANN_TERM"),  # 129
+    ("RIDER_MG_FLAG", "raw", "RIDER_MG_FLAG"),  # 130
+    ("RIDER_MG_SA", "round", "RIDER_MG_SA"),  # 131
+    ("RIDER_MG_ANN_PREM", "round", "RIDER_MG_ANN_PREM"),  # 132
+    ("RIDER_MG_EXTRA_PREM_ML", "round", "RIDER_MG_EXTRA_PREM_ML"),  # 133
+    ("RIDER_MG_EXTRA_PREM_OC", "round", "RIDER_MG_EXTRA_PREM_OC"),  # 134
+    ("RIDER_MG_EXTRA_PREM_SR", "round", "RIDER_MG_EXTRA_PREM_SR"),  # 135
+    ("RIDER_MG_EMR_ML", "round", "RIDER_MG_EMR_ML"),  # 136
+    ("RIDER_MG_EMR_OC", "round", "RIDER_MG_EMR_OC"),  # 137
+    ("RIDER_MG_EMR_SR", "round", "RIDER_MG_EMR_SR"),  # 138
+    ("RIDER_MG_COM_DATE", "date", "RIDER_MG_COM_DATE"),  # 139
+    ("RIDER_MG_TERM", "round", "RIDER_MG_TERM"),  # 140
+    ("RIDER_MC_FLAG", "raw", "RIDER_MC_FLAG"),  # 141
+    ("RIDER_MC_SA", "round", "RIDER_MC_SA"),  # 142
+    ("RIDER_MC_ANN_PREM", "round", "RIDER_MC_ANN_PREM"),  # 143
+    ("RIDER_MC_EXTRA_PREM_ML", "round", "RIDER_MC_EXTRA_PREM_ML"),  # 144
+    ("RIDER_MC_EXTRA_PREM_OC", "round", "RIDER_MC_EXTRA_PREM_OC"),  # 145
+    ("RIDER_MC_EXTRA_PREM_SR", "round", "RIDER_MC_EXTRA_PREM_SR"),  # 146
+    ("RIDER_MC_EMR_ML", "round", "RIDER_MC_EMR_ML"),  # 147
+    ("RIDER_MC_EMR_OC", "round", "RIDER_MC_EMR_OC"),  # 148
+    ("RIDER_MC_EMR_SR", "round", "RIDER_MC_EMR_SR"),  # 149
+    ("RIDER_MC_COM_DATE", "date", "RIDER_MC_COM_DATE"),  # 150
+    ("RIDER_MC_TERM", "round", "RIDER_MC_TERM"),  # 151
+    ("RIDER_FB_FLAG", "raw", "RIDER_FB_FLAG"),  # 152
+    ("RIDER_FB_SA", "round", "RIDER_FB_SA"),  # 153
+    ("RIDER_FB_PREM", "round", "RIDER_FB_PREM"),  # 154
+    ("RIDER_FB_COM_DATE", "date", "RIDER_FB_COM_DATE"),  # 155
+    ("RIDER_FB_ANN_TERM", "round", "RIDER_FB_ANN_TERM"),  # 156
+    ("RIDER_HB_FLAG", "raw", "RIDER_HB_FLAG"),  # 157
+    ("RIDER_HB_SA", "round", "RIDER_HB_SA"),  # 158
+    ("RIDER_HB_ANN_PREM", "round", "RIDER_HB_ANN_PREM"),  # 159
+    ("RIDER_HB_EMR", "round", "RIDER_HB_EMR"),  # 160
+    ("RIDER_HB_COM_DATE", "date", "RIDER_HB_COM_DATE"),  # 161
+    ("RIDER_HB_TERM", "round", "RIDER_HB_TERM"),  # 162
+    ("RIDER_HS_FLAG", "raw", "RIDER_HS_FLAG"),  # 163
+    ("RIDER_HS_SA", "round", "RIDER_HS_SA"),  # 164
+    ("RIDER_HS_ANN_PREM", "round", "RIDER_HS_ANN_PREM"),  # 165
+    ("RIDER_HS_EMR", "round", "RIDER_HS_EMR"),  # 166
+    ("RIDER_HS_COM_DATE", "date", "RIDER_HS_COM_DATE"),  # 167
+    ("RIDER_HS_TERM", "round", "RIDER_HS_TERM"),  # 168
+    ("RIDER_HP_FLAG", "raw", "RIDER_HP_FLAG"),  # 169
+    ("RIDER_HP_SA", "round", "RIDER_HP_SA"),  # 170
+    ("RIDER_HP_ANN_PREM", "round", "RIDER_HP_ANN_PREM"),  # 171
+    ("RIDER_HP_EMR", "round", "RIDER_HP_EMR"),  # 172
+    ("RIDER_HP_COM_DATE", "date", "RIDER_HP_COM_DATE"),  # 173
+    ("RIDER_HP_TERM", "round", "RIDER_HP_TERM"),  # 174
+    ("EXTRACT_TYPE", "raw", "EXTRACT_TYPE"),  # 175
+    ("COVER_CODE", "raw", "COVER_CODE"),  # 176
+    ("PRODUCT_CODE", "raw", "PRODUCT_CODE"),  # 177
+    ("PRODUCT_ID", "raw", "PRODUCT_ID"),  # 178
+    ("PH_PARTNER_ID", "raw", "PH_PARTNER_ID"),  # 179
+    ("PH_DOB", "raw", "PH_DOB"),  # 180
+    ("PH_SEX", "raw", "PH_SEX"),  # 181
+    ("ENTRY_AGE", "raw", "ENTRY_AGE"),  # 182
+    ("PREMS_PAID", "round", "PREMS_PAID"),  # 183
+    ("RISK_PREM", "round", "RISK_PREM"),  # 184
+    ("EXT_PREM", "round", "EXT_PREM"),  # 185
+    ("AMV", "round", "AMV"),  # 186
+    ("AAMV", "round", "AAMV"),  # 187
+    ("WOP_FLG", "raw", "WOP_FLG"),  # 188
+    ("DATE_OF_MODE_CHAGE", "date", "DATE_OF_MODE_CHAGE"),  # 189
+    ("RU_CODE", "raw", "RU_CODE"),  # 190
+    ("FIB_FLAG", "raw", "FIB_FLAG"),  # 191
+    ("SL_FLAG", "raw", "SL_FLAG"),  # 192
+    ("BASIC_AP", "round", "BASIC_AP"),  # 193
+    ("BASIC_SA", "round", "BASIC_SA"),  # 194
+    ("BRANCH_CODE", "raw", "BRANCH_CODE"),  # 195
+    ("DATE_LAST_ADV_DUE", "raw", "DATE_LAST_ADV_DUE"),  # 196
+    ("OS_ADV_INST", "round", "OS_ADV_INST"),  # 197
+    ("OS_ADV_PREM_PAID", "round", "OS_ADV_PREM_PAID"),  # 198
+    ("OS_DISC_PREM_PAID", "round", "OS_DISC_PREM_PAID"),  # 199
+    ("DISC_RATE_ANNUAL_START", "round", "DISC_RATE_ANNUAL_START"),  # 200
+    ("DISC_RATE_ANNUAL_LAST", "round", "DISC_RATE_ANNUAL_LAST"),  # 201
+    ("JL_INDICATOR", "raw", "JL_INDICATOR"),  # 202
+    ("RATE_INTEREST", "round", "RATE_INTEREST"),  # 203
+    ("CHANNEL_CODE", "raw", "IRDA_CODE"),  # 204
+    ("AMV_PREV_Y", "round", "AMV_PREV_Y"),  # 205
+    ("AMV_PREV_M", "round", "AMV_PREV_M"),  # 206
+    ("AAMV_PREV_Y", "round", "AAMV_PREV_Y"),  # 207
+    ("AAMV_PREV_M", "round", "AAMV_PREV_M"),  # 208
+    ("PREM_REC_DATE", "date", "PREM_REC_DATE"),  # 209
+    ("AGE_PROOF", "raw", "ST_NST_FLAG"),  # 210
+    ("EXTRACT_TYPE_PREV_M", "raw", "EXTRACT_TYPE_PREV_M"),  # 211
+    ("EXTRACT_TYPE_PREV_Y", "raw", "EXTRACT_TYPE_PREV_Y"),  # 212
+    ("STATUS_CHANGE_DT", "date", "STATUS_CHANGE_DT"),  # 213
+    ("CHANNEL_NAME", "raw", "CHANNEL_NAME"),  # 214
+    ("VERTICAL_CODE", "raw", "VERTICAL_CODE"),  # 215
+    ("PAY_PARTNER_NAME", "raw", "PAY_PARTNER_NAME"),  # 216
+    ("PAY_TYPE_FLAG", "raw", "PAY_TYPE_FLAG"),  # 217
+    ("ANGIOPLASTY_FLAG", "raw", "ANGIOPLASTY_FLAG"),  # 218
+    ("SPECIAL_BONUS", "raw", "SPECIAL_BONUS"),  # 219
+    ("ELC_FLAG", "raw", "ELC_FLAG"),  # 220
+    ("PREM_MULTIPLIER", "raw", "PREM_MULTIPLIER"),  # 221
+    ("ACB_AMOUNT", "raw", "ACB_AMOUNT"),  # 222
+    ("AGMI_AMOUNT", "raw", "AGMI_AMOUNT"),  # 223
+    ("AGLS_AMOUNT", "raw", "AGLS_AMOUNT"),  # 224
+    ("FREQUENCY", "raw", "FREQUENCY"),  # 225
+    ("FREQUENCY_GMI", "raw", "FREQUENCY_GMI"),  # 226
+    ("SUM_ASSURED_CURR_L2", "raw", "SUM_ASSURED_CURR_L2"),  # 227
+    ("ANNUAL_PREM_PS_CURR_L2", "raw", "ANNUAL_PREM_PS_CURR_L2"),  # 228
+    ("SPECIAL_BONUS_2021", "raw", "SPECIAL_BONUS_2021"),  # 229
+    ("ROP_INDICATOR", "raw", "ROP_INDICATOR"),  # 230
+    ("DEFERMENT_PERIOD", "raw", "DEFERMENT_PERIOD"),  # 231
+    ("IB_PERC", "raw", "IB_PERC"),  # 232
+    ("IB_HIGHER_PREM_MARKUP", "raw", "IB_HIGHER_PREM_MARKUP"),  # 233
+    ("IB_WEB_MARKUP", "raw", "IB_WEB_MARKUP"),  # 234
+    ("IB_STAFF_MARKUP", "raw", "IB_STAFF_MARKUP"),  # 235
+    ("IB_LOYALTY_MARKUP", "raw", "IB_LOYALTY_MARKUP"),  # 236
+    ("IB_AUTOPAY_MARKUP", "raw", "IB_AUTOPAY_MARKUP"),  # 237
+    ("IB_PARTNER_MARK_MARKUP", "raw", "IB_PARTNER_MARK_MARKUP"),  # 238
+    ("GMB_PERC", "raw", "GMB_PERC"),  # 239
+    ("GMB_HIGHER_PREM_MARKUP", "raw", "GMB_HIGHER_PREM_MARKUP"),  # 240
+    ("GMB_WEB_MARKUP", "raw", "GMB_WEB_MARKUP"),  # 241
+    ("GMB_STAFF_MARKUP", "raw", "GMB_STAFF_MARKUP"),  # 242
+    ("GMB_LOYALTY_MARKUP", "raw", "GMB_LOYALTY_MARKUP"),  # 243
+    ("GMB_AUTOPAY_MARKUP", "raw", "GMB_AUTOPAY_MARKUP"),  # 244
+    ("GMB_PARTNER_MARK_MARKUP", "raw", "GMB_PARTNER_MARK_MARKUP"),  # 245
+    ("ERC_FLAG", "raw", "ERC_FLAG"),  # 246
+    ("AGENTS_STATUS", "raw", "AGENTS_STATUS"),  # 247
+    ("LICENSE_START_DATE", "date", "LICENSE_START_DATE"),  # 248
+    ("DEATH_BENEFIT_OPTION", "raw", "DEATH_BENEFIT_OPTION"),  # 249
+    ("DEATH_BENEFIT_PERC", "raw", "DEATH_BENEFIT_PERC"),  # 250
+    ("LIFE_STAGE_UPGRADE_FLAG", "raw", "LIFE_STAGE_UPGRADE_FLAG"),  # 251
+    ("NUM_OF_PREM_HOLIDAYS", "raw", "NUM_OF_PREM_HOLIDAYS"),  # 252
+    ("RIDER1", "raw", "RIDER1"),  # 253
+    ("ADB_PREMIUM", "raw", "ADB_PREMIUM"),  # 254
+    ("RIDER1_SA", "raw", "RIDER1_SA"),  # 255
+    ("RIDER1_PT", "raw", "RIDER1_PT"),  # 256
+    ("RIDER1_BT", "raw", "RIDER1_BT"),  # 257
+    ("VACCINATE_FLAG", "raw", "VACCINATE_FLAG"),  # 258
+    ("SALARIED_YN", "case_yn", "SALARIED_YN"),  # 259
+    ("VACINATION_DISCOUNT", "raw", "VACINATION_DISCOUNT"),  # 260
+    ("SALARIED_DISCOUNT", "raw", "SALARIED_DISCOUNT"),  # 261
+    ("AUTO_PAY_REBATE_FLAG", "raw", "AUTO_PAY_REBATE_FLAG"),  # 262
+    ("LOYALTY_FLAG", "raw", "LOYALTY_FLAG"),  # 263
+    ("WORKSITE_REBATE_FLAG", "raw", "WORKSITE_REBATE_FLAG"),  # 264
+    ("INCOME_PERIOD", "raw", "INCOME_PERIOD"),  # 265
+    ("CHANNEL", "raw", "CHANNEL"),  # 266
+    ("SUB_CHANNEL", "raw", "SUB_CHANNEL"),  # 267
+    ("PARTNER", "raw", "PARTNER"),  # 268
+    ("IB_AMOUNT", "raw", "ANNUITY_AMOUNT"),  # 269
+    ("IB_FREQUENCY", "raw", "ANNUITY_FREQUENCY"),  # 270
+    ("FIRST_CUSTOMER", "raw", "FIRST_CUSTOMER"),  # 271
+    ("IIB_DISCOUNT", "raw", "IIB_DISCOUNT"),  # 272
+    ("EMR1", "raw", "EMR1"),  # 273
+    ("EMR2", "raw", "EMR2"),  # 274
+    ("EMR1_VALUE", "raw", "EMR1_VALUE"),  # 275
+    ("EMR2_VALUE", "raw", "EMR2_VALUE"),  # 276
+    ("MAIN_CHANNEL", "raw", "MAIN_CHANNEL"),  # 277
+    ("VERTICAL_NAME_MIS", "raw", "VERTICAL_NAME_MIS"),  # 278
+    ("INIT_POLS_WOP", "raw", "INIT_POLS_WOP"),  # 279
+    ("WOP_OPTION", "raw", "WOP_OPTION"),  # 280
+    ("DEFERED_INC_PERC", "raw", "DEFERED_INC_PERC"),  # 281
+    ("EARLY_INCOME_PERC", "raw", "EARLY_INCOME_PERC"),  # 282
+    ("INCREASING_INCOME_PERC", "raw", "INCREASING_INCOME_PERC"),  # 283
+    ("WEALTH_PERC", "raw", "WEALTH_PERC"),  # 284
+    ("EXISTING_CUSTOMER", "raw", "EXISTING_CUSTOMER"),  # 285
+    ("MULTI_OPTION_DISC", "raw", "MULTI_OPTION_DISC"),  # 286
+    ("BENEFIT_SA", "raw", "BENEFIT_SA"),  # 287
+    ("BENEFIT_PREMIUM", "raw", "BENEFIT_PREMIUM"),  # 288
+    ("ANNUAL_INCOME", "raw", "ANNUAL_INCOME"),  # 289
+    ("NRI_FLAG", "raw", "NRI_FLAG"),  # 290
+    ("INCOME_START_YEAR", "raw", "INCOME_START_YEAR"),  # 291
+    ("HNI_FLAG", "raw", "HNI_FLAG"),  # 292
+    ("R_CI_TERM", "raw", "R_CI_TERM"),  # 293
+    ("R_CI_SA", "raw", "R_CI_SA"),  # 294
+    ("R_ANN_CI_PREM", "raw", "R_ANN_CI_PREM"),  # 295
+    ("R_CI_FLAG", "raw", "R_CI_FLAG"),  # 296
+    ("R_AD_FLAG", "raw", "R_AD_FLAG"),  # 297
+    ("R_AD_TERM", "raw", "R_AD_TERM"),  # 298
+    ("R_AD_PREM_TERM", "raw", "R_AD_PREM_TERM"),  # 299
+    ("R_AD_SA", "raw", "R_AD_SA"),  # 300
+    ("R_AD_ANN_PREM", "raw", "R_AD_ANN_PREM"),  # 301
+    ("R_PD_FLAG", "raw", "R_PD_FLAG"),  # 302
+    ("R_PD_TERM", "raw", "R_PD_TERM"),  # 303
+    ("R_PD_PREM_TERM", "raw", "R_PD_PREM_TERM"),  # 304
+    ("R_PD_SA", "raw", "R_PD_SA"),  # 305
+    ("R_PD_ANN_PREM", "raw", "R_PD_ANN_PREM"),  # 306
+    ("R_WP_FLAG", "raw", "R_WP_FLAG"),  # 307
+    ("R_WP_TERM", "raw", "R_WP_TERM"),  # 308
+    ("R_WP_PREM_TERM", "raw", "R_WP_PREM_TERM"),  # 309
+    ("R_WP_ANN_PREM", "raw", "R_WP_ANN_PREM"),  # 310
+    ("R_WP2_FLAG", "raw", "R_WP2_FLAG"),  # 311
+    ("R_WP2_ANN_PREM", "raw", "R_WP2_ANN_PREM"),  # 312
+    ("WOP2_POL_TERM", "raw", "WOP2_POL_TERM"),  # 313
+    ("R_WP2_PREM_TERM", "raw", "R_WP2_PREM_TERM"),  # 314
+    ("JOINT_LIFE_AP", "raw", "JOINT_LIFE_AP"),  # 315
+    ("CEEC1_ANN_PREM", "raw", "CEEC1_ANN_PREM"),  # 316
+    ("CEEC1_BEN_PP", "raw", "CEEC1_BEN_PP"),  # 317
+    ("CEEC1_PREM_TERM_Y", "raw", "CEEC1_PREM_TERM_Y"),  # 318
+    ("CEEC1_POL_TERM_Y", "raw", "CEEC1_POL_TERM_Y"),  # 319
+    ("CEEC2_ANN_PREM", "raw", "CEEC2_ANN_PREM"),  # 320
+    ("CEEC2_BEN_PP", "raw", "CEEC2_BEN_PP"),  # 321
+    ("CEEC2_PREM_TERM_Y", "raw", "CEEC2_PREM_TERM_Y"),  # 322
+    ("CEEC2_POL_TERM_Y", "raw", "CEEC2_POL_TERM_Y"),  # 323
+    ("CEEC3_ANN_PREM", "raw", "CEEC3_ANN_PREM"),  # 324
+    ("CEEC3_BEN_PP", "raw", "CEEC3_BEN_PP"),  # 325
+    ("CEEC3_PREM_TERM_Y", "raw", "CEEC3_PREM_TERM_Y"),  # 326
+    ("CEEC3_POL_TERM_Y", "raw", "CEEC3_POL_TERM_Y"),  # 327
+    ("MTG_INT_PC", "raw", "MTG_INT_PC"),  # 328
+    ("RECEIPT_DATE", "date", "RECEIPT_DATE"),  # 329
+    ("SALARIED_REBATE_FLAG", "raw", "SALARIED_REBATE_FLAG"),  # 330
+    ("FULLY_VACCINATED_FLAG", "raw", "FULLY_VACCINATED_FLAG"),  # 331
+    ("LOAN_AMOUNT", "raw", "LOAN_AMOUNT"),  # 332
+    ("INTEREST_RATE", "raw", "INTEREST_RATE"),  # 333
+    ("DEATH_BEN_INSTALMENTS", "raw", "DEATH_BEN_INSTALMENTS"),  # 334
+    ("DTH_FACTOR", "raw", "DTH_FACTOR"),  # 335
+    ("IB_MULT_PERC", "raw", "IB_MULT_PERC"),  # 336
+    ("INCOME_FREQUENCY_TYPE", "case_ad", "INCOME_FREQUENCY_TYPE"),  # 337
+    ("AGE_CHILD_1", "raw", "AGE_CHILD_1"),  # 338
+    ("AGE_CHILD_2", "raw", "AGE_CHILD_2"),  # 339
+    ("AGE_CHILD_3", "raw", "AGE_CHILD_3"),  # 340
+    ("AGE_P1", "raw", "AGE_P1"),  # 341
+    ("AGE_P2", "raw", "AGE_P2"),  # 342
+    ("AGE_SP", "raw", "AGE_SP"),  # 343
+    ("SEX_P1", "raw", "SEX_P1"),  # 344
+    ("SEX_P2", "raw", "SEX_P2"),  # 345
+    ("SEX_SP", "raw", "SEX_SP"),  # 346
+    ("BASE_LIFE_DESC_DATE", "raw", "BASE_LIFE_DESC_DATE"),  # 347
+    ("BASE_LIFE_STATUS", "raw", "BASE_LIFE_STATUS"),  # 348
+    ("CC_INC_PC_1", "raw", "CC_INC_PC_1"),  # 349
+    ("CC_INC_PC_2", "raw", "CC_INC_PC_2"),  # 350
+    ("CC_INC_PC_3", "raw", "CC_INC_PC_3"),  # 351
+    ("FC_PYMTS_COUNT_M", "raw", "FC_PYMTS_COUNT_M"),  # 352
+    ("FPR_VAR_CC_IND", "raw", "FPR_VAR_CC_IND"),  # 353
+    ("FPR_VAR_FC_IND", "raw", "FPR_VAR_FC_IND"),  # 354
+    ("FPR_VAR_PC_IND", "raw", "FPR_VAR_PC_IND"),  # 355
+    ("FPR_VAR_SP_IND", "raw", "FPR_VAR_SP_IND"),  # 356
+    ("PARENT_1_LIFE_STATUS", "raw", "PARENT_1_LIFE_STATUS"),  # 357
+    ("PARENT_2_LIFE_STATUS", "raw", "PARENT_2_LIFE_STATUS"),  # 358
+    ("PC_INC_PC", "raw", "PC_INC_PC"),  # 359
+    ("SPOUSE_LIFE_STATUS", "raw", "SPOUSE_LIFE_STATUS"),  # 360
+    ("CUST_INIT_SALES_MARKUP", "raw", "CUST_INIT_SALES_MARKUP"),  # 361
+    ("FAMILY_BENEFIT_MARKUP", "raw", "FAMILY_BENEFIT_MARKUP"),  # 362
+    ("WORKSITE_MARKETING_DISCOUNT", "raw", "WORKSITE_MARKETING_DISCOUNT"),  # 363
+    ("ACCOUNT_AGGREGATOR_DISCOUNT", "raw", "ACCOUNT_AGGREGATOR_DISCOUNT"),  # 364
+    ("BONUS_RATE", "bonus_rate", "BONUS_RATE"),  # 365
+    ("ICB_PERC", "raw", "ICB_PERC"),  # 366
+    ("ROP_PERC", "raw", "ROP_PERC"),  # 367
+    ("MAT_OPTION", "raw", "MAT_OPTION"),  # 368
+    ("LOW_COVER_MARKUP_FOR_GA", "raw", "LOW_COVER_MARKUP_FOR_GA"),  # 369
+    ("PRIME_DISC_FLAG", "case_yn", "PRIME_DISC_FLAG"),  # 370
+    ("PRIME_DISC_AMT", "raw", "PRIME_DISC_AMT"),  # 371
+    ("OPD_POL_TERM", "raw", "OPD_POL_TERM"),  # 372
+    ("OPD_PREM_TERM", "raw", "OPD_PREM_TERM"),  # 373
+    ("OPD_ANN_PREM", "raw", "OPD_ANN_PREM"),  # 374
+    ("OPD_ATPD_SA", "raw", "OPD_ATPD_SA"),  # 375
+    ("OPD_VARIANT", "raw", "OPD_VARIANT"),  # 376
+    ("COMBO_PRODUCT_CODE", "raw", "COMBO_PRODUCT_CODE"),  # 377
+    ("SOLUTION_ID", "raw", "SOLUTION_ID"),  # 378
+]
+
+SPG_FIELDS = [
+    ("RECORD_TYPE", "raw", "RECORD_TYPE"),  # 1
+    ("PARTNER_ID", "raw", "PARTNER_ID"),  # 2
+    ("POL_NUMBER", "raw", "POL_NUMBER"),  # 3
+    ("SOURCE_CODE", "raw", "SOURCE_CODE"),  # 4
+    ("AGENCY_CODE", "raw", "AGENCY_CODE"),  # 5
+    ("CONTRACT_ID", "raw", "CONTRACT_ID"),  # 6
+    ("JOINT_LIFE_INDICATOR", "raw", "JOINT_LIFE_INDICATOR"),  # 7
+    ("SEX_CODE_L1", "raw", "SEX_CODE_L1"),  # 8
+    ("SEX_CODE_L2", "raw", "SEX_CODE_L2"),  # 9
+    ("SMOKER_CODE_L1", "raw", "SMOKER_CODE_L1"),  # 10
+    ("SMOKER_CODE_L2", "raw", "SMOKER_CODE_L2"),  # 11
+    ("ENTRY_DATE", "date", "ENTRY_DATE"),  # 12
+    ("COM_DATE", "date", "COM_DATE"),  # 13
+    ("DATE_OF_BIRTH_L1", "date", "DATE_OF_BIRTH_L1"),  # 14
+    ("DATE_OF_BIRTH_L2", "raw", "DATE_OF_BIRTH_L2"),  # 15
+    ("UW_CLASS", "raw", "UW_CLASS"),  # 16
+    ("LIFE_CLASS", "raw", "LIFE_CLASS"),  # 17
+    ("STATUS_CODE_CURR", "raw", "STATUS_CODE_CURR"),  # 18
+    ("FUP_CURR", "date", "FUP_CURR"),  # 19
+    ("POL_TERM_Y", "round", "POL_TERM_Y"),  # 20
+    ("PREM_PAYMT_TERM", "round", "PREM_PAYMT_TERM"),  # 21
+    ("PREM_PAYMT_MODE", "raw", "PREM_PAYMT_MODE"),  # 22
+    ("SUM_ASSURED_CURR", "round", "SUM_ASSURED_CURR"),  # 23
+    ("PAID_UP_SA_CURR", "round", "PAID_UP_SA_CURR"),  # 24
+    ("ANNUAL_PREM_PS_CURR", "round", "ANNUAL_PREM_PS_CURR"),  # 25
+    ("REV_BONUS_CURR", "round", "REV_BONUS_CURR"),  # 26
+    ("SIMPLE_BONUS_CURR", "round", "SIMPLE_BONUS_CURR"),  # 27
+    ("ANNUITY_AMOUNT_CURR", "round", "ANNUITY_AMOUNT_CURR"),  # 28
+    ("ANNUITY_MODE_CURR", "raw", "ANNUITY_MODE_CURR"),  # 29
+    ("EXTRA_PREM_L1_H", "round", "EXTRA_PREM_L1_H"),  # 30
+    ("EMR_L1_H", "round", "EMR_L1_H"),  # 31
+    ("EXTRA_PREM_L1_O", "round", "EXTRA_PREM_L1_O"),  # 32
+    ("EXTRA_PREM_L1_A", "round", "EXTRA_PREM_L1_A"),  # 33
+    ("EXTRA_PREM_L2_H", "round", "EXTRA_PREM_L2_H"),  # 34
+    ("EMR_L2_H", "round", "EMR_L2_H"),  # 35
+    ("EXTRA_PREM_L2_O", "round", "EXTRA_PREM_L2_O"),  # 36
+    ("EXTRA_PREM_L2_A", "round", "EXTRA_PREM_L2_A"),  # 37
+    ("EXIT_DATE_CURR", "date", "EXIT_DATE_CURR"),  # 38
+    ("MODE_OF_EXIT", "raw", "MODE_OF_EXIT"),  # 39
+    ("STATUS_CODE_PREV_Y", "raw", "STATUS_CODE_PREV_Y"),  # 40
+    ("FUP_PREV_Y", "date", "FUP_PREV_Y"),  # 41
+    ("SUM_ASSURED_PREV_Y", "round", "SUM_ASSURED_PREV_Y"),  # 42
+    ("PAID_UP_SA_PREV_Y", "round", "PAID_UP_SA_PREV_Y"),  # 43
+    ("ANNUAL_PREM_PS_PREV_Y", "round", "ANNUAL_PREM_PS_PREV_Y"),  # 44
+    ("REV_BONUS_PREV_Y", "round", "REV_BONUS_PREV_Y"),  # 45
+    ("SIMPLE_BONUS_PREV_Y", "round", "SIMPLE_BONUS_PREV_Y"),  # 46
+    ("ANNUITY_AMOUNT_PREV_Y", "round", "ANNUITY_AMOUNT_PREV_Y"),  # 47
+    ("ANNUITY_MODE_PREV_Y", "raw", "ANNUITY_MODE_PREV_Y"),  # 48
+    ("EXIT_DATE_PREV_Y", "date", "EXIT_DATE_PREV_Y"),  # 49
+    ("STATUS_CODE_PREV_M", "raw", "STATUS_CODE_PREV_M"),  # 50
+    ("FUP_PREV_M", "date", "FUP_PREV_M"),  # 51
+    ("SUM_ASSURED_PREV_M", "round", "SUM_ASSURED_PREV_M"),  # 52
+    ("PAID_UP_SA_PREV_M", "round", "PAID_UP_SA_PREV_M"),  # 53
+    ("ANNUAL_PREM_PS_PREV_M", "round", "ANNUAL_PREM_PS_PREV_M"),  # 54
+    ("REV_BONUS_PREV_M", "round", "REV_BONUS_PREV_M"),  # 55
+    ("SIMPLE_BONUS_PREV_M", "round", "SIMPLE_BONUS_PREV_M"),  # 56
+    ("ANNUITY_AMOUNT_PREV_M", "round", "ANNUITY_AMOUNT_PREV_M"),  # 57
+    ("ANNUITY_MODE_PREV_M", "raw", "ANNUITY_MODE_PREV_M"),  # 58
+    ("EXIT_DATE_PREV_M", "date", "EXIT_DATE_PREV_M"),  # 59
+    ("RIDER_AD_FLAG", "raw", "RIDER_AD_FLAG"),  # 60
+    ("RIDER_AD_SA", "round", "RIDER_AD_SA"),  # 61
+    ("RIDER_AD_ANN_PREM", "round", "RIDER_AD_ANN_PREM"),  # 62
+    ("RIDER_AD_COM_DATE", "date", "RIDER_AD_COM_DATE"),  # 63
+    ("RIDER_AD_TERM", "round", "RIDER_AD_TERM"),  # 64
+    ("RIDER_CI_FLAG", "raw", "RIDER_CI_FLAG"),  # 65
+    ("RIDER_CI_SA", "round", "RIDER_CI_SA"),  # 66
+    ("RIDER_CI_ANN_PREM", "round", "RIDER_CI_ANN_PREM"),  # 67
+    ("RIDER_CI_EXTRA_PREM_ML", "round", "RIDER_CI_EXTRA_PREM_ML"),  # 68
+    ("RIDER_CI_EXTRA_PREM_OC", "round", "RIDER_CI_EXTRA_PREM_OC"),  # 69
+    ("RIDER_CI_EXTRA_PREM_SR", "round", "RIDER_CI_EXTRA_PREM_SR"),  # 70
+    ("RIDER_CI_EMR_ML", "round", "RIDER_CI_EMR_ML"),  # 71
+    ("RIDER_CI_EMR_OC", "round", "RIDER_CI_EMR_OC"),  # 72
+    ("RIDER_CI_EMR_SR", "round", "RIDER_CI_EMR_SR"),  # 73
+    ("RIDER_CI_COM_DATE", "date", "RIDER_CI_COM_DATE"),  # 74
+    ("RIDER_CI_TERM", "round", "RIDER_CI_TERM"),  # 75
+    ("RIDER_DI_FLAG", "raw", "RIDER_DI_FLAG"),  # 76
+    ("RIDER_DI_SA", "round", "RIDER_DI_SA"),  # 77
+    ("RIDER_DI_ANN_PREM", "round", "RIDER_DI_ANN_PREM"),  # 78
+    ("RIDER_DI_COM_DATE", "date", "RIDER_DI_COM_DATE"),  # 79
+    ("RIDER_DI_TERM", "raw", "RIDER_DI_TERM"),  # 80
+    ("RIDER_SD_FLAG", "raw", "RIDER_SD_FLAG"),  # 81
+    ("RIDER_SD_SA", "round", "RIDER_SD_SA"),  # 82
+    ("RIDER_SD_ANN_PREM", "round", "RIDER_SD_ANN_PREM"),  # 83
+    ("RIDER_SD_EXTRA_PREM_ML", "round", "RIDER_SD_EXTRA_PREM_ML"),  # 84
+    ("RIDER_SD_EXTRA_PREM_OC", "round", "RIDER_SD_EXTRA_PREM_OC"),  # 85
+    ("RIDER_SD_EXTRA_PREM_SR", "round", "RIDER_SD_EXTRA_PREM_SR"),  # 86
+    ("RIDER_SD_EMR_ML", "round", "RIDER_SD_EMR_ML"),  # 87
+    ("RIDER_SD_EMR_OC", "round", "RIDER_SD_EMR_OC"),  # 88
+    ("RIDER_SD_EMR_SR", "round", "RIDER_SD_EMR_SR"),  # 89
+    ("RIDER_SD_COM_DATE", "date", "RIDER_SD_COM_DATE"),  # 90
+    ("RIDER_SD_TERM", "round", "RIDER_SD_TERM"),  # 91
+    ("RIDER_HC_FLAG", "raw", "RIDER_HC_FLAG"),  # 92
+    ("RIDER_HC_SA", "round", "RIDER_HC_SA"),  # 93
+    ("RIDER_HC_ANN_PREM", "round", "RIDER_HC_ANN_PREM"),  # 94
+    ("RIDER_HC_EXTRA_PREM_ML", "round", "RIDER_HC_EXTRA_PREM_ML"),  # 95
+    ("RIDER_HC_EXTRA_PREM_OC", "round", "RIDER_HC_EXTRA_PREM_OC"),  # 96
+    ("RIDER_HC_EXTRA_PREM_SR", "round", "RIDER_HC_EXTRA_PREM_SR"),  # 97
+    ("RIDER_HC_EMR_ML", "round", "RIDER_HC_EMR_ML"),  # 98
+    ("RIDER_HC_EMR_OC", "round", "RIDER_HC_EMR_OC"),  # 99
+    ("RIDER_HC_EMR_SR", "round", "RIDER_HC_EMR_SR"),  # 100
+    ("RIDER_HC_COM_DATE", "date", "RIDER_HC_COM_DATE"),  # 101
+    ("RIDER_HC_TERM", "round", "RIDER_HC_TERM"),  # 102
+    ("RIDER_WP_FLAG", "raw", "RIDER_WP_FLAG"),  # 103
+    ("RIDER_WP_SA", "round", "RIDER_WP_SA"),  # 104
+    ("RIDER_WP_ANN_PREM", "round", "RIDER_WP_ANN_PREM"),  # 105
+    ("RIDER_WP_COM_DATE", "date", "RIDER_WP_COM_DATE"),  # 106
+    ("RIDER_WP_TERM", "round", "RIDER_WP_TERM"),  # 107
+    ("RIDER_CW_FLAG", "raw", "RIDER_CW_FLAG"),  # 108
+    ("RIDER_CW_SA", "round", "RIDER_CW_SA"),  # 109
+    ("RIDER_CW_ANN_PREM", "round", "RIDER_CW_ANN_PREM"),  # 110
+    ("RIDER_CW_EXTRA_PREM_ML", "round", "RIDER_CW_EXTRA_PREM_ML"),  # 111
+    ("RIDER_CW_EXTRA_PREM_OC", "round", "RIDER_CW_EXTRA_PREM_OC"),  # 112
+    ("RIDER_CW_EXTRA_PREM_SR", "round", "RIDER_CW_EXTRA_PREM_SR"),  # 113
+    ("RIDER_CW_EMR_ML", "round", "RIDER_CW_EMR_ML"),  # 114
+    ("RIDER_CW_EMR_OC", "round", "RIDER_CW_EMR_OC"),  # 115
+    ("RIDER_CW_EMR_SR", "round", "RIDER_CW_EMR_SR"),  # 116
+    ("RIDER_CW_COM_DATE", "date", "RIDER_CW_COM_DATE"),  # 117
+    ("RIDER_CW_TERM", "round", "RIDER_CW_TERM"),  # 118
+    ("RIDER_SL_FLAG", "raw", "RIDER_SL_FLAG"),  # 119
+    ("RIDER_SL_SA", "round", "RIDER_SL_SA"),  # 120
+    ("RIDER_SL_ANN_PREM", "round", "RIDER_SL_ANN_PREM"),  # 121
+    ("RIDER_SL_EXTRA_PREM_ML", "round", "RIDER_SL_EXTRA_PREM_ML"),  # 122
+    ("RIDER_SL_EXTRA_PREM_OC", "round", "RIDER_SL_EXTRA_PREM_OC"),  # 123
+    ("RIDER_SL_EXTRA_PREM_SR", "round", "RIDER_SL_EXTRA_PREM_SR"),  # 124
+    ("RIDER_SL_EMR_ML", "round", "RIDER_SL_EMR_ML"),  # 125
+    ("RIDER_SL_EMR_OC", "round", "RIDER_SL_EMR_OC"),  # 126
+    ("RIDER_SL_EMR_SR", "round", "RIDER_SL_EMR_SR"),  # 127
+    ("RIDER_SL_COM_DATE", "date", "RIDER_SL_COM_DATE"),  # 128
+    ("RIDER_SL_ANN_TERM", "round", "RIDER_SL_ANN_TERM"),  # 129
+    ("RIDER_MG_FLAG", "raw", "RIDER_MG_FLAG"),  # 130
+    ("RIDER_MG_SA", "round", "RIDER_MG_SA"),  # 131
+    ("RIDER_MG_ANN_PREM", "round", "RIDER_MG_ANN_PREM"),  # 132
+    ("RIDER_MG_EXTRA_PREM_ML", "round", "RIDER_MG_EXTRA_PREM_ML"),  # 133
+    ("RIDER_MG_EXTRA_PREM_OC", "round", "RIDER_MG_EXTRA_PREM_OC"),  # 134
+    ("RIDER_MG_EXTRA_PREM_SR", "round", "RIDER_MG_EXTRA_PREM_SR"),  # 135
+    ("RIDER_MG_EMR_ML", "round", "RIDER_MG_EMR_ML"),  # 136
+    ("RIDER_MG_EMR_OC", "round", "RIDER_MG_EMR_OC"),  # 137
+    ("RIDER_MG_EMR_SR", "round", "RIDER_MG_EMR_SR"),  # 138
+    ("RIDER_MG_COM_DATE", "date", "RIDER_MG_COM_DATE"),  # 139
+    ("RIDER_MG_TERM", "round", "RIDER_MG_TERM"),  # 140
+    ("RIDER_MC_FLAG", "raw", "RIDER_MC_FLAG"),  # 141
+    ("RIDER_MC_SA", "round", "RIDER_MC_SA"),  # 142
+    ("RIDER_MC_ANN_PREM", "round", "RIDER_MC_ANN_PREM"),  # 143
+    ("RIDER_MC_EXTRA_PREM_ML", "round", "RIDER_MC_EXTRA_PREM_ML"),  # 144
+    ("RIDER_MC_EXTRA_PREM_OC", "round", "RIDER_MC_EXTRA_PREM_OC"),  # 145
+    ("RIDER_MC_EXTRA_PREM_SR", "round", "RIDER_MC_EXTRA_PREM_SR"),  # 146
+    ("RIDER_MC_EMR_ML", "round", "RIDER_MC_EMR_ML"),  # 147
+    ("RIDER_MC_EMR_OC", "round", "RIDER_MC_EMR_OC"),  # 148
+    ("RIDER_MC_EMR_SR", "round", "RIDER_MC_EMR_SR"),  # 149
+    ("RIDER_MC_COM_DATE", "date", "RIDER_MC_COM_DATE"),  # 150
+    ("RIDER_MC_TERM", "round", "RIDER_MC_TERM"),  # 151
+    ("RIDER_FB_FLAG", "raw", "RIDER_FB_FLAG"),  # 152
+    ("RIDER_FB_SA", "round", "RIDER_FB_SA"),  # 153
+    ("RIDER_FB_PREM", "round", "RIDER_FB_PREM"),  # 154
+    ("RIDER_FB_COM_DATE", "date", "RIDER_FB_COM_DATE"),  # 155
+    ("RIDER_FB_ANN_TERM", "round", "RIDER_FB_ANN_TERM"),  # 156
+    ("RIDER_HB_FLAG", "raw", "RIDER_HB_FLAG"),  # 157
+    ("RIDER_HB_SA", "round", "RIDER_HB_SA"),  # 158
+    ("RIDER_HB_ANN_PREM", "round", "RIDER_HB_ANN_PREM"),  # 159
+    ("RIDER_HB_EMR", "round", "RIDER_HB_EMR"),  # 160
+    ("RIDER_HB_COM_DATE", "date", "RIDER_HB_COM_DATE"),  # 161
+    ("RIDER_HB_TERM", "round", "RIDER_HB_TERM"),  # 162
+    ("RIDER_HS_FLAG", "raw", "RIDER_HS_FLAG"),  # 163
+    ("RIDER_HS_SA", "round", "RIDER_HS_SA"),  # 164
+    ("RIDER_HS_ANN_PREM", "round", "RIDER_HS_ANN_PREM"),  # 165
+    ("RIDER_HS_EMR", "round", "RIDER_HS_EMR"),  # 166
+    ("RIDER_HS_COM_DATE", "date", "RIDER_HS_COM_DATE"),  # 167
+    ("RIDER_HS_TERM", "round", "RIDER_HS_TERM"),  # 168
+    ("RIDER_HP_FLAG", "raw", "RIDER_HP_FLAG"),  # 169
+    ("RIDER_HP_SA", "round", "RIDER_HP_SA"),  # 170
+    ("RIDER_HP_ANN_PREM", "round", "RIDER_HP_ANN_PREM"),  # 171
+    ("RIDER_HP_EMR", "round", "RIDER_HP_EMR"),  # 172
+    ("RIDER_HP_COM_DATE", "date", "RIDER_HP_COM_DATE"),  # 173
+    ("RIDER_HP_TERM", "round", "RIDER_HP_TERM"),  # 174
+    ("EXTRACT_TYPE", "raw", "EXTRACT_TYPE"),  # 175
+    ("COVER_CODE", "raw", "COVER_CODE"),  # 176
+    ("PRODUCT_CODE", "raw", "PRODUCT_CODE"),  # 177
+    ("PRODUCT_ID", "raw", "PRODUCT_ID"),  # 178
+    ("PH_PARTNER_ID", "raw", "PH_PARTNER_ID"),  # 179
+    ("PH_DOB", "raw", "PH_DOB"),  # 180
+    ("PH_SEX", "raw", "PH_SEX"),  # 181
+    ("ENTRY_AGE", "raw", "ENTRY_AGE"),  # 182
+    ("PREMS_PAID", "round", "PREMS_PAID"),  # 183
+    ("RISK_PREM", "round", "RISK_PREM"),  # 184
+    ("EXT_PREM", "round", "EXT_PREM"),  # 185
+    ("AMV", "round", "AMV"),  # 186
+    ("AAMV", "round", "AAMV"),  # 187
+    ("WOP_FLG", "raw", "WOP_FLG"),  # 188
+    ("DATE_OF_MODE_CHAGE", "date", "DATE_OF_MODE_CHAGE"),  # 189
+    ("RU_CODE", "raw", "RU_CODE"),  # 190
+    ("FIB_FLAG", "raw", "FIB_FLAG"),  # 191
+    ("SL_FLAG", "raw", "SL_FLAG"),  # 192
+    ("BASIC_AP", "round", "BASIC_AP"),  # 193
+    ("BASIC_SA", "round", "BASIC_SA"),  # 194
+    ("BRANCH_CODE", "raw", "BRANCH_CODE"),  # 195
+    ("DATE_LAST_ADV_DUE", "raw", "DATE_LAST_ADV_DUE"),  # 196
+    ("OS_ADV_INST", "round", "OS_ADV_INST"),  # 197
+    ("OS_ADV_PREM_PAID", "round", "OS_ADV_PREM_PAID"),  # 198
+    ("OS_DISC_PREM_PAID", "round", "OS_DISC_PREM_PAID"),  # 199
+    ("DISC_RATE_ANNUAL_START", "round", "DISC_RATE_ANNUAL_START"),  # 200
+    ("DISC_RATE_ANNUAL_LAST", "round", "DISC_RATE_ANNUAL_LAST"),  # 201
+    ("JL_INDICATOR", "raw", "JL_INDICATOR"),  # 202
+    ("RATE_INTEREST", "round", "RATE_INTEREST"),  # 203
+    ("CHANNEL_CODE", "raw", "IRDA_CODE"),  # 204
+    ("AMV_PREV_Y", "round", "AMV_PREV_Y"),  # 205
+    ("AMV_PREV_M", "round", "AMV_PREV_M"),  # 206
+    ("AAMV_PREV_Y", "round", "AAMV_PREV_Y"),  # 207
+    ("AAMV_PREV_M", "round", "AAMV_PREV_M"),  # 208
+    ("PREM_REC_DATE", "date", "PREM_REC_DATE"),  # 209
+    ("AGE_PROOF", "raw", "ST_NST_FLAG"),  # 210
+    ("EXTRACT_TYPE_PREV_M", "raw", "EXTRACT_TYPE_PREV_M"),  # 211
+    ("EXTRACT_TYPE_PREV_Y", "raw", "EXTRACT_TYPE_PREV_Y"),  # 212
+    ("STATUS_CHANGE_DT", "date", "STATUS_CHANGE_DT"),  # 213
+    ("CHANNEL_NAME", "raw", "CHANNEL_NAME"),  # 214
+    ("VERTICAL_CODE", "raw", "VERTICAL_CODE"),  # 215
+    ("PAY_PARTNER_NAME", "raw", "PAY_PARTNER_NAME"),  # 216
+    ("PAY_TYPE_FLAG", "raw", "PAY_TYPE_FLAG"),  # 217
+    ("ANGIOPLASTY_FLAG", "raw", "ANGIOPLASTY_FLAG"),  # 218
+    ("SPECIAL_BONUS", "raw", "SPECIAL_BONUS"),  # 219
+    ("ELC_FLAG", "raw", "ELC_FLAG"),  # 220
+    ("R_CI_TERM", "raw", "R_CI_TERM"),  # 221
+    ("R_CI_SA", "raw", "R_CI_SA"),  # 222
+    ("R_ANN_CI_PREM", "raw", "R_ANN_CI_PREM"),  # 223
+    ("R_CI_FLAG", "raw", "R_CI_FLAG"),  # 224
+    ("R_AD_FLAG", "raw", "R_AD_FLAG"),  # 225
+    ("R_AD_TERM", "raw", "R_AD_TERM"),  # 226
+    ("R_AD_PREM_TERM", "raw", "R_AD_PREM_TERM"),  # 227
+    ("R_AD_SA", "raw", "R_AD_SA"),  # 228
+    ("R_AD_ANN_PREM", "raw", "R_AD_ANN_PREM"),  # 229
+    ("R_PD_FLAG", "raw", "R_PD_FLAG"),  # 230
+    ("R_PD_TERM", "raw", "R_PD_TERM"),  # 231
+    ("R_PD_PREM_TERM", "raw", "R_PD_PREM_TERM"),  # 232
+    ("R_PD_SA", "raw", "R_PD_SA"),  # 233
+    ("R_PD_ANN_PREM", "raw", "R_PD_ANN_PREM"),  # 234
+    ("R_WP_FLAG", "raw", "R_WP_FLAG"),  # 235
+    ("R_WP_TERM", "raw", "R_WP_TERM"),  # 236
+    ("R_WP_PREM_TERM", "raw", "R_WP_PREM_TERM"),  # 237
+    ("R_WP_ANN_PREM", "raw", "R_WP_ANN_PREM"),  # 238
+    ("R_WP2_FLAG", "raw", "R_WP2_FLAG"),  # 239
+    ("R_WP2_ANN_PREM", "raw", "R_WP2_ANN_PREM"),  # 240
+    ("WOP2_POL_TERM", "raw", "WOP2_POL_TERM"),  # 241
+    ("R_WP2_PREM_TERM", "raw", "R_WP2_PREM_TERM"),  # 242
+    ("JOINT_LIFE_AP", "raw", "JOINT_LIFE_AP"),  # 243
+    ("CEEC1_ANN_PREM", "raw", "CEEC1_ANN_PREM"),  # 244
+    ("CEEC1_BEN_PP", "raw", "CEEC1_BEN_PP"),  # 245
+    ("CEEC1_PREM_TERM_Y", "raw", "CEEC1_PREM_TERM_Y"),  # 246
+    ("CEEC1_POL_TERM_Y", "raw", "CEEC1_POL_TERM_Y"),  # 247
+    ("CEEC2_ANN_PREM", "raw", "CEEC2_ANN_PREM"),  # 248
+    ("CEEC2_BEN_PP", "raw", "CEEC2_BEN_PP"),  # 249
+    ("CEEC2_PREM_TERM_Y", "raw", "CEEC2_PREM_TERM_Y"),  # 250
+    ("CEEC2_POL_TERM_Y", "raw", "CEEC2_POL_TERM_Y"),  # 251
+    ("CEEC3_ANN_PREM", "raw", "CEEC3_ANN_PREM"),  # 252
+    ("CEEC3_BEN_PP", "raw", "CEEC3_BEN_PP"),  # 253
+    ("CEEC3_PREM_TERM_Y", "raw", "CEEC3_PREM_TERM_Y"),  # 254
+    ("CEEC3_POL_TERM_Y", "raw", "CEEC3_POL_TERM_Y"),  # 255
+    ("MTG_INT_PC", "raw", "MTG_INT_PC"),  # 256
+    ("RECEIPT_DATE", "date", "RECEIPT_DATE"),  # 257
+    ("ERC_FLAG", "raw", "ERC_FLAG"),  # 258
+    ("AGENTS_STATUS", "raw", "AGENTS_STATUS"),  # 259
+    ("LICENSE_START_DATE", "date", "LICENSE_START_DATE"),  # 260
+    ("CHANNEL", "raw", "CHANNEL"),  # 261
+    ("SUB_CHANNEL", "raw", "SUB_CHANNEL"),  # 262
+    ("PARTNER", "raw", "PARTNER"),  # 263
+    ("SALARIED_REBATE_FLAG", "raw", "SALARIED_REBATE_FLAG"),  # 264
+    ("SALARIED_DISCOUNT", "raw", "SALARIED_DISCOUNT"),  # 265
+    ("FULLY_VACCINATED_FLAG", "raw", "FULLY_VACCINATED_FLAG"),  # 266
+    ("VACINATION_DISCOUNT", "raw", "VACINATION_DISCOUNT"),  # 267
+    ("FIRST_CUSTOMER", "raw", "FIRST_CUSTOMER"),  # 268
+    ("IIB_DISCOUNT", "raw", "IIB_DISCOUNT"),  # 269
+    ("MAIN_CHANNEL", "raw", "MAIN_CHANNEL"),  # 270
+    ("VERTICAL_NAME_MIS", "raw", "VERTICAL_NAME_MIS"),  # 271
+    ("ANNUAL_INCOME", "raw", "ANNUAL_INCOME"),  # 272
+    ("NRI_FLAG", "raw", "NRI_FLAG"),  # 273
+    ("HNI_FLAG", "raw", "HNI_FLAG"),  # 274
+]
+
+assert len(TRAD_FIELDS) == 378, len(TRAD_FIELDS)
+assert len(SPG_FIELDS) == 274, len(SPG_FIELDS)
+
+
+# =============================================================================
+# Value rendering (file_generation_spec.md R1-R3; identical to the proven
+# Annuity/UL implementations)
+# =============================================================================
+
+def _scale_of(dtype):
+    if dtype.startswith("decimal"):
+        return int(dtype[dtype.index(",") + 1:dtype.index(")")])
+    if dtype.startswith(("int", "bigint", "smallint", "tinyint")):
+        return 0
+    return 10
+
+
+def oracle_num_to_str(col, scale):
+    """Implicit NUMBER -> VARCHAR2: shortest form, never scientific.
+    6065.0000000000->'6065', 0.5->'.5', -0.5->'-.5', 0->'0'."""
+    s = F.format_number(col.cast(T.DecimalType(38, scale)), scale)
+    s = F.regexp_replace(s, ",", "")
+    if scale > 0:
+        s = F.regexp_replace(s, r"(\.[0-9]*?)0+$", r"$1")
+        s = F.regexp_replace(s, r"\.$", "")
+        s = F.regexp_replace(s, r"^(-?)0\.", r"$1.")
+    return s
+
+
+def oracle_date_to_str(col):
+    """TO_CHAR(d,'DD/MM/YYYY'); to_date first (+05:30 shift; IST session)."""
+    return F.date_format(F.to_date(col), "dd/MM/yyyy")
+
+
+def render_field(df, name, kind, src):
+    """Render one field exactly as the package's cursor/v_line does."""
+    dtypes = dict(df.dtypes)
+    if src not in dtypes:
+        raise ValueError(f"source column missing: {src} (field {name})")
+    col = F.col("`" + src + "`")
+    dtype = dtypes[src]
+
+    if kind == "date":
+        rendered = oracle_date_to_str(col)
+    elif kind == "round":
+        # ROUND(x): half away from zero, 0 dp; NULL stays NULL
+        rendered = oracle_num_to_str(F.round(col.cast(T.DecimalType(38, 10)), 0), 0)
+    elif kind == "case_yn":
+        u = F.upper(col)
+        rendered = (F.when(u == "YES", F.lit("Y"))
+                     .when(u == "NO", F.lit("N"))
+                     .otherwise(u))
+    elif kind == "case_ad":
+        rendered = F.when(col == "AD", F.lit("AD"))
+    elif kind == "bonus_rate":
+        # the joined _BONUS_RATE_CALC column (see _with_bonus_rate)
+        c2 = F.col("_BONUS_RATE_CALC")
+        rendered = oracle_num_to_str(c2, 10)
+    elif dtype.startswith(("date", "timestamp")):
+        # raw date field without TO_CHAR in the package -- only
+        # BASE_LIFE_DESC_DATE (all NULL). Preflight warns if non-null.
+        rendered = oracle_date_to_str(col)
+    elif dtype.startswith(("decimal", "int", "bigint", "smallint",
+                           "double", "float", "tinyint")):
+        rendered = oracle_num_to_str(col, _scale_of(dtype))
+    else:
+        rendered = col.cast("string")      # strings byte-verbatim, NO TRIM
+
+    return F.coalesce(rendered, F.lit(""))
+
+
+def build_line(df, fields):
+    """Explicit coalesce-concat. NEVER concat_ws (it drops NULLs AND their
+    separators, shifting every later field)."""
+    parts = []
+    for i, (name, kind, src) in enumerate(fields):
+        if i:
+            parts.append(F.lit(","))
+        parts.append(render_field(df, name, kind, src))
+    return F.concat(*parts)
+
+
+# =============================================================================
+# BONUS_RATE -- the scalar subquery, as a join
+# =============================================================================
+
+def _with_bonus_rate(df, spark):
+    if not BONUS_RATES_PATH:
+        raise ValueError("BONUS_RATES_PATH not set -- the BONUS_RATE field "
+                         "is computed from azbj_bonus_rates at file time.")
+    br = spark.read.format("delta").load(BONUS_RATES_PATH)
+    br = br.toDF(*[c.upper() for c in br.columns])
+    dim = (br.filter((F.col("BONUS_TYPE") == "OTB")
+                     & (F.to_date(F.col("BONUS_FROM_DATE"))
+                        == F.lit("2025-04-01").cast("date"))
+                     & F.col("PRODUCT_ID").isin(329, 359)
+                     & F.col("COVER_CODE").isin("RP10A01", "L182A01",
+                                                "L182B01"))
+             .groupBy(F.col("PRODUCT_ID").alias("BR_PID"),
+                      F.col("COVER_CODE").alias("BR_COV"))
+             .agg(F.first("BONUS_RATE").alias("_BR_RATE"),
+                  F.count(F.lit(1)).alias("_BR_N")))
+    bad = dim.filter(F.col("_BR_N") > 1).count()
+    if bad:
+        raise ValueError(f"azbj_bonus_rates: {bad} (product,cover) key(s) "
+                         "with >1 OTB rows -- Oracle's scalar subquery would "
+                         "raise ORA-01427 and abort the file. Resolve first.")
+    out = (df.join(dim, (df["PRODUCT_ID"] == F.col("BR_PID"))
+                   & (df["COVER_CODE"] == F.col("BR_COV")), "left")
+             .withColumn("_BONUS_RATE_CALC",
+                         F.when(F.col("BR_PID").isNotNull()
+                                & (F.to_date(F.col("COM_DATE"))
+                                   <= F.lit("2025-03-31").cast("date")),
+                                F.col("_BR_RATE")))
+             .drop("BR_PID", "BR_COV", "_BR_RATE", "_BR_N"))
+    return out
+
+
+# =============================================================================
+# Structural preflight (file_generation_spec.md section 3)
+# =============================================================================
+
+def _preflight(df, fields, label):
+    dtypes = dict(df.dtypes)
+    missing = [s for _, k, s in fields
+               if k != "bonus_rate" and s not in dtypes]
+    if missing:
+        raise ValueError(f"{label}: source is missing {sorted(set(missing))}")
+
+    checks = []
+    for name, kind, src in fields:
+        if kind == "bonus_rate":
+            continue
+        dt = dtypes[src]
+        q = "`" + src + "`"
+        if dt == "string" and kind == "raw":
+            checks.append(F.sum(F.when(F.col(q).contains(","), 1)
+                                 .otherwise(0)).alias("COMMA|" + src))
+            checks.append(F.sum(F.when(F.col(q).rlike(r"[\r\n]"), 1)
+                                 .otherwise(0)).alias("NEWLINE|" + src))
+        if kind == "raw" and dt.startswith(("date", "timestamp")):
+            checks.append(F.sum(F.when(F.col(q).isNotNull(), 1)
+                                 .otherwise(0)).alias("RAWDATE|" + src))
+        if dt.startswith(("decimal", "double", "float")):
+            checks.append(F.sum(F.when(
+                render_field(df, name, kind, src).rlike("[eE]"), 1)
+                .otherwise(0)).alias("SCI|" + src))
+
+    row = df.agg(*checks).collect()[0].asDict() if checks else {}
+    problems = {k: v for k, v in row.items() if v}
+    if problems:
+        msg = (f"{label}: structural findings -> {problems}"
+               "\n  COMMA|/NEWLINE| break the record layout (NOTE: Step-12"
+               " stage 3 replaced commas in channel -- any remaining comma"
+               " is a new source value; compare with Oracle before override)."
+               "\n  RAWDATE| a date field the package emits WITHOUT TO_CHAR"
+               " has non-null values -- Oracle would print NLS format; check."
+               "\n  SCI| scientific notation reached the rendered output.")
+        if STRICT:
+            raise ValueError(msg)
+        logger.warning(msg)
+
+
+def _write_single_txt(spark, line_df, file_name):
+    staging = f"{FILE_DIR}/_staging_{file_name}"
+    final = f"{FILE_DIR}/{file_name}"
+    (line_df.coalesce(1).write.mode("overwrite")
+            .option("lineSep", LINE_SEP).text(staging))
+    jvm = spark._jvm
+    hconf = spark._jsc.hadoopConfiguration()
+    Path = jvm.org.apache.hadoop.fs.Path
+    staging_p, final_p = Path(staging), Path(final)
+    fs = staging_p.getFileSystem(hconf)
+    parts = [st.getPath() for st in fs.listStatus(staging_p)
+             if st.getPath().getName().startswith("part-")]
+    if len(parts) != 1:
+        raise RuntimeError(f"expected one part file, found {len(parts)}")
+    if fs.exists(final_p):
+        fs.delete(final_p, False)
+    if not fs.rename(parts[0], final_p):
+        raise RuntimeError(f"could not rename {parts[0]} -> {final_p}")
+    fs.delete(staging_p, True)
+    logger.info("wrote %s", final)
+    return final
+
+
+# =============================================================================
+# Generators
+# =============================================================================
+
+def _load_source(spark):
+    df = spark.read.format("delta").load(SRC_PATH)
+    df = df.toDF(*[c.upper() for c in df.columns])
+    if APPLY_JUNE_EXCLUSIONS:
+        n0 = df.count()
+        df = df.filter(~F.col("CONTRACT_ID").cast("long")
+                        .isin(JUNE_EXCLUDE_IDS))
+        n1 = df.count()
+        logger.info("June exclusions: %d rows removed (expect 23); "
+                    "%d -> %d", n0 - n1, n0, n1)
+    return df
+
+
+def generate_trad_file(spark, src_df, p_month=P_MONTH):
+    """trad_file -> VAL_TRAD_<p_month>.TXT, 378 fields,
+    product_id NOT IN the group/CSC set."""
+    df = _with_bonus_rate(src_df, spark)
+    sel = df.filter(~F.col("PRODUCT_ID").cast("long")
+                     .isin(TRAD_EXCLUDE_PRODUCTS))
+    _preflight(sel, TRAD_FIELDS, "trad_file")
+    n = sel.count()
+    logger.info("trad_file: %s rows (product NOT IN %s)",
+                f"{n:,}", TRAD_EXCLUDE_PRODUCTS)
+    line_df = sel.select(build_line(sel, TRAD_FIELDS).alias("value"))
+    path = _write_single_txt(spark, line_df, f"VAL_TRAD_{p_month}.TXT")
+    logger.info("trad_file: %s records x %d fields -> %s",
+                f"{n:,}", len(TRAD_FIELDS), path)
+    return path, n
+
+
+def generate_spg_file(spark, src_df, p_month=P_MONTH):
+    """spg_file -> VAL_SPG_<p_month>.TXT, 274 fields, product_id = 321.
+    321 rows ALSO appear in VAL_TRAD (it is not in the exclusion list) --
+    that duplication is Oracle's, by design."""
+    sel = src_df.filter(F.col("PRODUCT_ID").cast("long").isin(SPG_PRODUCT_IDS))
+    _preflight(sel, SPG_FIELDS, "spg_file")
+    n = sel.count()
+    logger.info("spg_file: %s rows (product 321)", f"{n:,}")
+    line_df = sel.select(build_line(sel, SPG_FIELDS).alias("value"))
+    path = _write_single_txt(spark, line_df, f"VAL_SPG_{p_month}.TXT")
+    logger.info("spg_file: %s records x %d fields -> %s",
+                f"{n:,}", len(SPG_FIELDS), path)
+    return path, n
+
+
+def main():
+    for nm, v in (("SRC_PATH", SRC_PATH), ("FILE_DIR", FILE_DIR),
+                  ("BONUS_RATES_PATH", BONUS_RATES_PATH)):
+        if not v:
+            raise ValueError(f"{nm} not set")
+    spark = (SparkSession.builder.appName("trad_file_gen")
+             # MANDATORY: a UTC session renders the previous calendar day for
+             # every +05:30-shifted date column.
+             .config("spark.sql.session.timeZone", "Asia/Kolkata")
+             .getOrCreate())
+    spark.conf.set("spark.sql.session.timeZone", "Asia/Kolkata")
+    assert spark.conf.get("spark.sql.session.timeZone") == "Asia/Kolkata"
+
+    df = _load_source(spark)
+    total = df.count()
+
+    _, n_trad = generate_trad_file(spark, df)
+    _, n_spg = generate_spg_file(spark, df)
+
+    n_excluded_products = df.filter(
+        F.col("PRODUCT_ID").cast("long").isin(TRAD_EXCLUDE_PRODUCTS)).count()
+    logger.info("accounting: VAL_TRAD %s + excluded-product rows %s = %s ; "
+                "table (after June exclusions) %s ; VAL_SPG %s (321 subset, "
+                "also inside VAL_TRAD)",
+                f"{n_trad:,}", f"{n_excluded_products:,}",
+                f"{n_trad + n_excluded_products:,}", f"{total:,}", f"{n_spg:,}")
+    if n_trad + n_excluded_products != total:
+        raise ValueError("trad_file filter does not partition the table -- "
+                         "rows dropped or duplicated")
+    spark.stop()
+
+
+if __name__ == "__main__":
+    main()
