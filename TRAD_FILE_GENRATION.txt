@@ -906,9 +906,151 @@ def _preflight(df, fields, label):
         logger.warning(msg)
 
 
-def _write_single_txt(spark, line_df, file_name):
+# -----------------------------------------------------------------------------
+# WRITE STRATEGY (changed 2026-10-20 after repeated 'Broken pipe' failures).
+#
+# The original coalesce(1) write streams ONE ~7GB multipart upload through a
+# single task for 30+ minutes; the platform's S3 gateway drops connections of
+# that lifetime, and no retry setting fixes a pattern the gateway refuses.
+#
+# "s3_multipart_copy" (default) writes the SAME lines as ~ROWS_PER_PART-row
+# parallel part files (each upload lasts a minute or two, task-level retries
+# cheap), then assembles the single TXT SERVER-SIDE with S3 UploadPartCopy:
+# the final object is stitched from the parts inside the storage system --
+# no bytes stream through our client, each copy call is near-instant.
+# BYTE-IDENTICAL output: every part ends with LINE_SEP and parts concatenate
+# in part-number order; row order was never part of the contract (Oracle's
+# cursor has no ORDER BY).
+#
+# Needs boto3 on the driver (import checked up front) and the S3 endpoint +
+# keys from the BALIC_S3_* environment variables (never hardcoded), falling
+# back to the session's fs.s3a.* Hadoop conf. S3 constraint honoured: every
+# part except the last must be >= 5MB -- ROWS_PER_PART=120000 gives ~60-90MB
+# parts; a violation raises with instructions instead of writing a bad file.
+#
+# WRITE_MODE = "coalesce" restores the original single-task behaviour.
+# -----------------------------------------------------------------------------
+import os
+
+WRITE_MODE = "s3_multipart_copy"     # or "coalesce"
+ROWS_PER_PART = 120000
+MIN_PART_BYTES = 5 * 1024 * 1024     # S3 multipart minimum (all but last)
+
+
+def _split_s3(uri):
+    for scheme in ("s3a://", "s3://"):
+        if uri.startswith(scheme):
+            bucket, _, key = uri[len(scheme):].partition("/")
+            return bucket, key
+    raise ValueError(f"not an s3a path: {uri}")
+
+
+def _boto_client(spark):
+    try:
+        import boto3
+    except ImportError:
+        raise RuntimeError(
+            "boto3 is not available on the driver. Either install it, or set "
+            "WRITE_MODE='coalesce' to use the original single-task write.")
+    hconf = spark._jsc.hadoopConfiguration()
+    endpoint = os.environ.get("BALIC_S3_ENDPOINT") \
+        or hconf.get("fs.s3a.endpoint")
+    access = os.environ.get("BALIC_S3_ACCESS_KEY") \
+        or hconf.get("fs.s3a.access.key")
+    secret = os.environ.get("BALIC_S3_SECRET_KEY") \
+        or hconf.get("fs.s3a.secret.key")
+    if not (endpoint and access and secret):
+        raise RuntimeError("S3 endpoint/credentials not found in BALIC_S3_* "
+                           "env vars or fs.s3a.* conf")
+    if not endpoint.startswith("http"):
+        scheme = "https" if hconf.get(
+            "fs.s3a.connection.ssl.enabled", "true") == "true" else "http"
+        endpoint = f"{scheme}://{endpoint}"
+    return boto3.client("s3", endpoint_url=endpoint,
+                        aws_access_key_id=access,
+                        aws_secret_access_key=secret)
+
+
+def _concat_on_s3(spark, staging, final):
+    """Assemble `final` from the part files under `staging`, server-side."""
+    s3 = _boto_client(spark)
+    bucket, skey = _split_s3(staging)
+    fbucket, fkey = _split_s3(final)
+    if fbucket != bucket:
+        raise ValueError("staging and final must be in the same bucket")
+
+    parts, token = [], None
+    while True:
+        kw = dict(Bucket=bucket, Prefix=skey.rstrip("/") + "/")
+        if token:
+            kw["ContinuationToken"] = token
+        resp = s3.list_objects_v2(**kw)
+        for o in resp.get("Contents", []):
+            name = o["Key"].rsplit("/", 1)[-1]
+            if name.startswith("part-") and o["Size"] > 0:
+                parts.append((o["Key"], o["Size"]))
+        if not resp.get("IsTruncated"):
+            break
+        token = resp["NextContinuationToken"]
+    if not parts:
+        raise RuntimeError(f"no part files under {staging}")
+    parts.sort(key=lambda p: p[0])      # part-00000, part-00001, ...
+
+    small = [k for k, sz in parts[:-1] if sz < MIN_PART_BYTES]
+    if small:
+        raise RuntimeError(
+            f"{len(small)} non-final part(s) below the 5MB S3 multipart "
+            f"minimum (first: {small[0]}). Lower ROWS_PER_PART's divisor -- "
+            "i.e. RAISE ROWS_PER_PART so parts get bigger -- and rerun.")
+
+    logger.info("concat: %d parts, %s bytes total -> %s",
+                len(parts), f"{sum(sz for _, sz in parts):,}", final)
+    mpu = s3.create_multipart_upload(Bucket=bucket, Key=fkey)
+    try:
+        etags = []
+        for i, (key, _sz) in enumerate(parts, 1):
+            r = s3.upload_part_copy(
+                Bucket=bucket, Key=fkey, UploadId=mpu["UploadId"],
+                PartNumber=i, CopySource={"Bucket": bucket, "Key": key})
+            etags.append({"PartNumber": i,
+                          "ETag": r["CopyPartResult"]["ETag"]})
+        s3.complete_multipart_upload(
+            Bucket=bucket, Key=fkey, UploadId=mpu["UploadId"],
+            MultipartUpload={"Parts": etags})
+    except Exception:
+        s3.abort_multipart_upload(Bucket=bucket, Key=fkey,
+                                  UploadId=mpu["UploadId"])
+        raise
+    # staging cleanup (parts + markers)
+    token = None
+    while True:
+        kw = dict(Bucket=bucket, Prefix=skey.rstrip("/") + "/")
+        if token:
+            kw["ContinuationToken"] = token
+        resp = s3.list_objects_v2(**kw)
+        keys = [{"Key": o["Key"]} for o in resp.get("Contents", [])]
+        if keys:
+            s3.delete_objects(Bucket=bucket, Delete={"Objects": keys})
+        if not resp.get("IsTruncated"):
+            break
+        token = resp["NextContinuationToken"]
+
+
+def _write_single_txt(spark, line_df, file_name, n_rows):
     staging = f"{FILE_DIR}/_staging_{file_name}"
     final = f"{FILE_DIR}/{file_name}"
+
+    if WRITE_MODE == "s3_multipart_copy":
+        nparts = max(1, (n_rows + ROWS_PER_PART - 1) // ROWS_PER_PART)
+        logger.info("writing %s rows as %d part(s), then server-side concat",
+                    f"{n_rows:,}", nparts)
+        (line_df.repartition(nparts).write.mode("overwrite")
+                .option("lineSep", LINE_SEP).text(staging))
+        _concat_on_s3(spark, staging, final)
+        logger.info("wrote %s", final)
+        return final
+
+    # original behaviour: single-task write + rename
     (line_df.coalesce(1).write.mode("overwrite")
             .option("lineSep", LINE_SEP).text(staging))
     jvm = spark._jvm
@@ -957,7 +1099,7 @@ def generate_trad_file(spark, src_df, p_month=P_MONTH):
     logger.info("trad_file: %s rows (product NOT IN %s)",
                 f"{n:,}", TRAD_EXCLUDE_PRODUCTS)
     line_df = sel.select(build_line(sel, TRAD_FIELDS).alias("value"))
-    path = _write_single_txt(spark, line_df, f"VAL_TRAD_{p_month}.TXT")
+    path = _write_single_txt(spark, line_df, f"VAL_TRAD_{p_month}.TXT", n)
     logger.info("trad_file: %s records x %d fields -> %s",
                 f"{n:,}", len(TRAD_FIELDS), path)
     return path, n
@@ -972,7 +1114,7 @@ def generate_spg_file(spark, src_df, p_month=P_MONTH):
     n = sel.count()
     logger.info("spg_file: %s rows (product 321)", f"{n:,}")
     line_df = sel.select(build_line(sel, SPG_FIELDS).alias("value"))
-    path = _write_single_txt(spark, line_df, f"VAL_SPG_{p_month}.TXT")
+    path = _write_single_txt(spark, line_df, f"VAL_SPG_{p_month}.TXT", n)
     logger.info("spg_file: %s records x %d fields -> %s",
                 f"{n:,}", len(SPG_FIELDS), path)
     return path, n
