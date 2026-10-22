@@ -22,3 +22,45 @@
     "ph_dob",                   #         1
     "ph_sex",                   #         1
 ]
+
+
+import boto3, os, re
+
+s3 = boto3.client("s3", endpoint_url=os.environ["BALIC_S3_ENDPOINT"],
+                  aws_access_key_id=os.environ["BALIC_S3_ACCESS_KEY"],
+                  aws_secret_access_key=os.environ["BALIC_S3_SECRET_KEY"])
+BUCKET  = "gold"
+STAGING = "Valuation/June_Run/Gold/June26/filegen/Trad/_staging_VAL_TRAD_JUN2026.TXT/"
+FINAL   = "Valuation/June_Run/Gold/June26/filegen/Trad/VAL_TRAD_JUN2026.TXT"
+
+parts, token = [], None
+while True:
+    kw = dict(Bucket=BUCKET, Prefix=STAGING)
+    if token: kw["ContinuationToken"] = token
+    r = s3.list_objects_v2(**kw)
+    for o in r.get("Contents", []):
+        if o["Key"].rsplit("/", 1)[-1].startswith("part-") and o["Size"] > 0:
+            parts.append((o["Key"], o["Size"]))
+    if not r.get("IsTruncated"): break
+    token = r["NextContinuationToken"]
+parts.sort(key=lambda p: p[0])
+print(len(parts), "parts,", sum(s for _, s in parts), "bytes")
+assert parts and all(s >= 5*1024*1024 for _, s in parts[:-1]), "part-size check"
+
+mpu = s3.create_multipart_upload(Bucket=BUCKET, Key=FINAL)
+try:
+    etags = [{"PartNumber": i,
+              "ETag": s3.upload_part_copy(Bucket=BUCKET, Key=FINAL,
+                        UploadId=mpu["UploadId"], PartNumber=i,
+                        CopySource={"Bucket": BUCKET, "Key": k})
+                       ["CopyPartResult"]["ETag"]}
+             for i, (k, _) in enumerate(parts, 1)]
+    s3.complete_multipart_upload(Bucket=BUCKET, Key=FINAL,
+        UploadId=mpu["UploadId"], MultipartUpload={"Parts": etags})
+    print("DONE ->", FINAL)
+finally:
+    pass  # on failure: s3.abort_multipart_upload(...)
+
+# cleanup staging after you confirm the file looks right:
+# (rerun the list loop and delete_objects on all STAGING keys)
+
