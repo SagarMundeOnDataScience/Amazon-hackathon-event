@@ -1,0 +1,103 @@
+# Group valuation kickoff probe (read-only). Run in a notebook cell; paste the printed output back.
+# Prints: [1] schema of every table needed through script 4c, [2] the June-2026 run logs,
+#         [3] four state checks on the bronze snapshot.
+from pyspark.sql import functions as F
+
+spark.conf.set("spark.sql.session.timeZone", "Asia/Kolkata")   # mandatory project convention
+
+PREFIX = "customer"          # bronze schema for azbj_* tables -- change if your catalog differs
+VAL_DATE = "2026-06-30"
+
+INPUTS = [                   # read by the jobs we build
+    "azbj_certificate_policy", "azbj_certificate_policy_extn",
+    "azbj_master_policy_contract", "azbj_master_policy_extn",
+    "azbj_grp_upload_detail", "azbj_grp_upload_summary",
+    "azbj_system_constants",
+    "azbj_grp_pol_serv_upld_summary", "azbj_grp_pol_serv_upld_detail",
+    "azbj_grp_valuation_mph",
+]
+ENGINE_OUTPUTS = [           # read as finished Oracle output
+    "azbj_grp_invest_monthly", "azbj_grp_account_monthly",
+    "azbj_grp_acc_value_dtls_temp", "azbj_grp_valuation_logs",
+]
+ORACLE_TARGETS = [           # what we reconcile our output against
+    "gssk_moratorium_calc", "total_mph", "gcpl_mfi_valuation_dl",
+    "moratorium_data1", "group_summary_temp_upld", "group_summary_deletion",
+    "azbj_gtln_missing_mph", "azbj_gtln_member_data",
+]
+
+
+def tbl(name):
+    return spark.table(f"{PREFIX}.{name}")
+
+
+def exists(name):
+    try:
+        tbl(name).limit(0).count()
+        return True
+    except Exception:
+        return False
+
+
+# ---------------------------------------------------------------- [1] schemas
+print("=" * 30, "[1] SCHEMAS", "=" * 30)
+for group, names in [("INPUT", INPUTS), ("ENGINE_OUTPUT", ENGINE_OUTPUTS), ("ORACLE_TARGET", ORACLE_TARGETS)]:
+    for n in names:
+        if not exists(n):
+            print(f"\n## {group} {PREFIX}.{n}  -> NOT FOUND")
+            continue
+        df = tbl(n)
+        print(f"\n## {group} {PREFIX}.{n}  rows={df.count()}  cols={len(df.columns)}")
+        for f in df.schema.fields:
+            print(f"{f.name}\t{f.dataType.simpleString()}")
+
+# ------------------------------------------------------------------- [2] logs
+print("\n" + "=" * 30, "[2] RUN LOGS", "=" * 30)
+if exists("azbj_grp_valuation_logs"):
+    logs = tbl("azbj_grp_valuation_logs")
+    logs.agg(F.min("CREATION_DATE"), F.max("CREATION_DATE"), F.count(F.lit(1))).show(truncate=False)
+    logs.groupBy("PROCESS_NAME").count().orderBy("PROCESS_NAME").show(200, truncate=False)
+    # the per-scheme / per-job rows are noise; keep the rows that carry parameters
+    keep = ~F.col("PROCESS_NAME").isin("gssk_MORATORIUM_UPDATE", "gssk_MORATORIUM_back_UPDATE", "GECNCHECK")
+    for r in logs.where(keep).orderBy("LOG_ID").select("LOG_ID", "PROCESS_NAME", "CREATION_DATE", "LOG_MESSAGE").collect():
+        if "v_job" in (r["LOG_MESSAGE"] or "") or "job id" in (r["LOG_MESSAGE"] or ""):
+            continue
+        print(r["LOG_ID"], "|", r["PROCESS_NAME"], "|", r["CREATION_DATE"], "|", r["LOG_MESSAGE"])
+
+# ----------------------------------------------------------------- [3] checks
+print("\n" + "=" * 30, "[3] STATE CHECKS", "=" * 30)
+
+# 3a. certificate table: before / after moratorium update / after back-update
+cp = tbl("azbj_certificate_policy")
+print("3a. moratorium marker on azbj_certificate_policy")
+(cp.where(F.col("ADD_INSRD_RELATION") == "ABC")
+   .groupBy(F.substring("ACTIVITY_LOG", 1, 28).alias("activity_log_prefix"))
+   .agg(F.count(F.lit(1)).alias("rows"), F.countDistinct("MASTER_POLICY_NO").alias("schemes"))
+   .show(truncate=False))
+
+# 3b. moratorium scheme list
+sc = tbl("azbj_system_constants")
+n_mor = (sc.where((F.col("SYS_TYPE") == "GROUP") & (F.col("SYS_CODE") == "COVID19_GSSK_EXTENSION"))
+           .select(F.regexp_replace("SYS_DESC", r"\|", "").alias("mph")).distinct().count())
+print("3b. moratorium schemes in azbj_system_constants:", n_mor)
+
+# 3c. azbj_grp_invest_monthly: rows dated after the valuation date
+im = tbl("azbj_grp_invest_monthly").withColumn("d", F.to_date("DATE_OF_PAYMENT"))
+print("3c. azbj_grp_invest_monthly rows at / after valuation date")
+im.where(F.col("d") == VAL_DATE).agg(F.count(F.lit(1)).alias("rows_at_val_date"),
+                                     F.countDistinct("CONTRACT_ID").alias("contracts")).show()
+(im.where(F.col("d") > VAL_DATE).groupBy("d")
+   .agg(F.count(F.lit(1)).alias("rows"), F.countDistinct("CONTRACT_ID").alias("contracts"))
+   .orderBy("d").show(50))
+print("    negative account_value at val date:",
+      im.where((F.col("d") == VAL_DATE) & (F.col("ACCOUNT_VALUE") < 0)).count())
+
+# 3d. GGG/GLE/GSG/GLTP account values at the valuation date
+av = tbl("azbj_grp_acc_value_dtls_temp").withColumn("d", F.to_date("DATE_OF_PAYMENT"))
+mpc = tbl("azbj_master_policy_contract").select("MASTER_POLICY_NO", "SCHEME_TYPE")
+print("3d. azbj_grp_acc_value_dtls_temp at valuation date, by scheme type and event")
+(av.where(F.col("d") == VAL_DATE).join(mpc, "MASTER_POLICY_NO", "left")
+   .groupBy("SCHEME_TYPE", "EVENT_TYPE_CODE")
+   .agg(F.count(F.lit(1)).alias("rows"),
+        F.sum(F.col("CLOSING_BALANCE").isNull().cast("int")).alias("null_closing_balance"))
+   .orderBy("SCHEME_TYPE", "EVENT_TYPE_CODE").show(100, truncate=False))
