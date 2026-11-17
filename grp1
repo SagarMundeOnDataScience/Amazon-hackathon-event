@@ -1,138 +1,208 @@
-# Group valuation kickoff probe (read-only). Run in a notebook cell; paste the printed output back.
-# Prints: [1] schema of every table needed through script 4c, [2] the June-2026 run logs,
-#         [3] four state checks on the bronze snapshot.
+"""
+Group valuation -- Step 1 side jobs (part 1 of 2)
+=============================================================================
+Builds two of the tables that 1_rate_config.sql -> pkg3.rate_updation creates:
+
+  total_mph               <- pkg3.gssk_check
+  gcpl_MFI_valuation_dl   <- azbj_valuation_group_pkg.gcpl_delete1  (the OLD
+                             package; pkg3.gcpl_Deletion_job calls it)
+
+Run parameters are the ones Oracle logged for the June-2026 run
+(azbj_grp_valuation_logs, 04-JUL-2026).
+
+>>> OPEN ITEMS >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
+ A. NO ORACLE TARGET in bronze for either table, so parity is NOT proven.
+    Reconcile gcpl_MFI_valuation_dl against MFI_Deletion_JUN_2026.xlsx.
+ B. total_mph.mod_no is ROWNUM with no ORDER BY in Oracle -- not reproducible.
+    We number by master_policy_no. DEVIATION, excluded from parity.
+ C. APPLY_GCPL_DELETE2: whether gcpl_delete2 (average = round(total/members,2))
+    was run in June is not visible in the logs. False = the column stays NULL,
+    which is what gcpl_delete1 alone leaves. Settle from the Excel file.
+ D. gcpl_delete1 ran BEFORE the moratorium update (14:10); bronze holds the
+    AFTER state. cert_pre_moratorium() rebuilds the before state from the
+    backup columns. It refuses to run unless every marked row was marked by
+    THIS run (see the assert) -- otherwise the backup columns are stale.
+ E. OUT_BASE is a placeholder -- CONFIRM the silver path.
+<<< OPEN ITEMS <<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<
+"""
+import calendar
+import os
+
+from pyspark.sql import SparkSession, Window
 from pyspark.sql import functions as F
+from pyspark.sql import types as T
 
-spark.conf.set("spark.sql.session.timeZone", "Asia/Kolkata")   # mandatory project convention
+# ----------------------------------------------------------------- run config
+VALUATION_DATE = (2026, 6, 30)        # TRUNC(SYSDATE,'mm') - 1 on the run date
+RUN_DATE_TXT = "04-JUL-26"            # SYSDATE of the Oracle run, NLS DD-MON-RR
+APPLY_GCPL_DELETE2 = False            # open item C
 
-VAL_DATE = "2026-06-30"
-FILE_FORMAT = "delta"        # only used for entries that are storage paths: "delta" or "parquet"
-
-# Fill in the FULL location of each table. Either form works:
-#   a qualified table name ...... "sl1_preprod.customer.azbj_certificate_policy"
-#   a storage path .............. "s3a://bucket/bronze/customer/azbj_certificate_policy"
-# Leave a value as "" if the table is not in bronze -- it is reported as NOT PROVIDED.
-
-INPUTS = {                   # read by the jobs we build
-    "azbj_certificate_policy":        "",
-    "azbj_certificate_policy_extn":   "",
-    "azbj_master_policy_contract":    "",
-    "azbj_master_policy_extn":        "",
-    "azbj_grp_upload_detail":         "",
-    "azbj_grp_upload_summary":        "",
-    "azbj_system_constants":          "",
-    "azbj_grp_pol_serv_upld_summary": "",
-    "azbj_grp_pol_serv_upld_detail":  "",
-    "azbj_grp_valuation_mph":         "",
+BRONZE = {
+    "azbj_certificate_policy":     "s3a://sn-layer/customer.azbj_certificate_policy/",
+    "azbj_master_policy_contract": "s3a://sn-layer/sn-layer/customer.azbj_master_policy_contract/",
+    "azbj_master_policy_extn":     "s3a://sn-layer/sn-layer/customer.azbj_master_policy_extn/",
 }
-ENGINE_OUTPUTS = {           # read as finished Oracle output
-    "azbj_grp_invest_monthly":        "",
-    "azbj_grp_account_monthly":       "",
-    "azbj_grp_acc_value_dtls_temp":   "",
-    "azbj_grp_valuation_logs":        "",
-}
-ORACLE_TARGETS = {           # what we reconcile our output against
-    "gssk_moratorium_calc":           "",
-    "total_mph":                      "",
-    "gcpl_mfi_valuation_dl":          "",
-    "moratorium_data1":               "",
-    "group_summary_temp_upld":        "",
-    "group_summary_deletion":         "",
-    "azbj_gtln_missing_mph":          "",
-    "azbj_gtln_member_data":          "",
-}
-LOC = {**INPUTS, **ENGINE_OUTPUTS, **ORACLE_TARGETS}
+OUT_BASE = "s3a://sn-layer/silver/group_valuation/"        # open item E
+
+NUM = T.DecimalType(38, 10)
+
+# Oracle DATEs sit in bronze as the same wall-clock value at UTC, so the
+# valuation date must be built in UTC too. Epoch arithmetic keeps the session
+# time zone out of the day counts entirely.
+VAL_EPOCH = calendar.timegm(VALUATION_DATE + (0, 0, 0))
 
 
-def tbl(name):
-    loc = LOC[name]
-    if "://" in loc or loc.startswith("/"):
-        return spark.read.format(FILE_FORMAT).load(loc)
-    return spark.table(loc)
+# ---------------------------------------------------------------------- infra
+def build_spark():
+    access, secret = os.environ.get("BALIC_S3_ACCESS_KEY"), os.environ.get("BALIC_S3_SECRET_KEY")
+    if not access or not secret:
+        raise RuntimeError("BALIC_S3_ACCESS_KEY / BALIC_S3_SECRET_KEY are not set.")
+    spark = (SparkSession.builder.appName("Group_step1_side_jobs")
+             .config("spark.sql.extensions", "io.delta.sql.DeltaSparkSessionExtension")
+             .config("spark.sql.catalog.spark_catalog", "org.apache.spark.sql.delta.catalog.DeltaCatalog")
+             .config("spark.hadoop.fs.s3a.access.key", access)
+             .config("spark.hadoop.fs.s3a.secret.key", secret)
+             .config("spark.hadoop.fs.s3a.endpoint", os.environ.get("BALIC_S3_ENDPOINT", "10.3.6.81"))
+             .config("spark.hadoop.fs.s3a.path.style.access", "true")
+             .config("spark.hadoop.fs.s3a.connection.ssl.enabled", "false")
+             .config("spark.hadoop.fs.s3a.impl", "org.apache.hadoop.fs.s3a.S3AFileSystem")
+             .config("spark.sql.session.timeZone", "Asia/Kolkata")
+             .getOrCreate())
+    spark.conf.set("spark.sql.session.timeZone", "Asia/Kolkata")   # pitfalls A1
+    return spark
 
 
-def exists(name):
-    if not LOC.get(name):
-        return False
-    try:
-        tbl(name).limit(0).count()
-        return True
-    except Exception as e:
-        print(f"   ! {name}: {str(e)[:160]}")
-        return False
+def read_tbl(spark, path):
+    """Source-read boundary: '' -> NULL on strings and nothing else. Never trim."""
+    df = spark.read.format("delta").load(path)
+    for f in df.schema.fields:
+        if isinstance(f.dataType, T.StringType):
+            df = df.withColumn(f.name, F.when(F.col(f.name) == "", F.lit(None)).otherwise(F.col(f.name)))
+    return df
 
 
-# ---------------------------------------------------------------- [1] schemas
-print("=" * 30, "[1] SCHEMAS", "=" * 30)
-for group, names in [("INPUT", INPUTS), ("ENGINE_OUTPUT", ENGINE_OUTPUTS), ("ORACLE_TARGET", ORACLE_TARGETS)]:
-    for n in names:
-        if not exists(n):
-            print(f"\n## {group} {n}  -> " + ("NOT FOUND at " + LOC[n] if LOC[n] else "NOT PROVIDED"))
-            continue
-        df = tbl(n)
-        print(f"\n## {group} {n}  [{LOC[n]}]  rows={df.count()}  cols={len(df.columns)}")
-        for f in df.schema.fields:
-            print(f"{f.name}\t{f.dataType.simpleString()}")
+# -------------------------------------------------- certificate, before 14:10
+def cert_pre_moratorium(cert):
+    """azbj_certificate_policy as it stood BEFORE pkg3.gssk_MORATORIUM_UPDATE.
 
-# ------------------------------------------------------------------- [2] logs
-print("\n" + "=" * 30, "[2] RUN LOGS", "=" * 30)
-if exists("azbj_grp_valuation_logs"):
-    logs = tbl("azbj_grp_valuation_logs")
-    logs.agg(F.min("CREATION_DATE"), F.max("CREATION_DATE"), F.count(F.lit(1))).show(truncate=False)
-    logs.groupBy("PROCESS_NAME").count().orderBy("PROCESS_NAME").show(200, truncate=False)
-    # the per-scheme / per-job rows are noise; keep the rows that carry parameters
-    keep = ~F.col("PROCESS_NAME").isin("gssk_MORATORIUM_UPDATE", "gssk_MORATORIUM_back_UPDATE", "GECNCHECK")
-    for r in logs.where(keep).orderBy("LOG_ID").select("LOG_ID", "PROCESS_NAME", "CREATION_DATE", "LOG_MESSAGE").collect():
-        if "v_job" in (r["LOG_MESSAGE"] or "") or "job id" in (r["LOG_MESSAGE"] or ""):
-            continue
-        print(r["LOG_ID"], "|", r["PROCESS_NAME"], "|", r["CREATION_DATE"], "|", r["LOG_MESSAGE"])
-
-# ----------------------------------------------------------------- [3] checks
-print("\n" + "=" * 30, "[3] STATE CHECKS", "=" * 30)
+    The update overwrote premium / tenure / cover end date on the moratorium
+    members and parked the old values in three spare columns, marking the row
+    ADD_INSRD_RELATION = 'ABC'. Put the old values back for marked rows.
+    """
+    marked = F.col("ADD_INSRD_RELATION") == "ABC"          # NULL marker -> not marked
+    stale = cert.where(marked & ~F.coalesce(
+        F.col("ACTIVITY_LOG").startswith("UPDATED BACK PREMIUM TIME=" + RUN_DATE_TXT), F.lit(False))).count()
+    if stale:
+        raise ValueError(
+            f"{stale} rows carry the moratorium marker but were not marked on {RUN_DATE_TXT}. "
+            "Their backup columns do not hold this run's before-values. Stop and review.")
+    return (cert
+            .withColumn("BASIC_LIFE_COVER_PREMIUM",
+                        F.when(marked, F.col("ACCRUED_GRATUITY")).otherwise(F.col("BASIC_LIFE_COVER_PREMIUM")))
+            .withColumn("LOAN_TENURE",
+                        F.when(marked, F.col("ACCRUED_LIABILITY")).otherwise(F.col("LOAN_TENURE")))
+            .withColumn("RISK_COVERAGE_END_DATE",
+                        F.when(marked, F.col("MEDICAL_SUB_DATE")).otherwise(F.col("RISK_COVERAGE_END_DATE"))))
 
 
-def need(*names):
-    miss = [n for n in names if not exists(n)]
-    if miss:
-        print("   skipped, missing:", miss)
-    return not miss
+# ------------------------------------------------------------------ total_mph
+def build_total_mph(cert, mpe):
+    """pkg3.gssk_check.
+
+    create table total_mph as select master_policy_no from azbj_master_policy_extn
+     where scheme_type in ('GSSK','GCPL','GSJS','GSJO','PMJJ')
+       and 'Y' = (case when scheme_type='GCPL' then MFI_FLAG else 'Y' end)
+    then actual_cnt = count of members with policy_status in ('N','R').
+    One row per extn row -- duplicates in extn are kept, as in Oracle.
+    """
+    schemes = (mpe.where(F.col("SCHEME_TYPE").isin("GSSK", "GCPL", "GSJS", "GSJO", "PMJJ"))
+                  .where((F.col("SCHEME_TYPE") != "GCPL") | (F.col("MFI_FLAG") == "Y"))
+                  .select("MASTER_POLICY_NO"))
+    cnt = (cert.where(F.col("POLICY_STATUS").isin("N", "R"))
+               .groupBy("MASTER_POLICY_NO").agg(F.count(F.lit(1)).alias("n")))
+    return (schemes.join(cnt, "MASTER_POLICY_NO", "left")
+            .select(F.col("MASTER_POLICY_NO"),
+                    F.coalesce(F.col("n"), F.lit(0)).cast(NUM).alias("ACTUAL_CNT"),      # COUNT -> 0, never NULL
+                    F.row_number().over(Window.orderBy("MASTER_POLICY_NO")).cast(NUM).alias("MOD_NO"),  # item B
+                    F.lit(None).cast("string").alias("FLAG")))                           # added, never set
 
 
-# 3a. certificate table: before / after moratorium update / after back-update
-print("3a. moratorium marker on azbj_certificate_policy")
-if need("azbj_certificate_policy"):
-    (tbl("azbj_certificate_policy").where(F.col("ADD_INSRD_RELATION") == "ABC")
-        .groupBy(F.substring("ACTIVITY_LOG", 1, 28).alias("activity_log_prefix"))
-        .agg(F.count(F.lit(1)).alias("rows"), F.countDistinct("MASTER_POLICY_NO").alias("schemes"))
-        .show(truncate=False))
+# ------------------------------------------------------ gcpl_MFI_valuation_dl
+def build_gcpl_mfi_valuation_dl(cert_pre, mpc, mpe):
+    """azbj_valuation_group_pkg.gcpl_delete1 (+ gcpl_delete2 when enabled).
 
-# 3b. moratorium scheme list
-print("3b. moratorium schemes in azbj_system_constants")
-if need("azbj_system_constants"):
-    sc = tbl("azbj_system_constants")
-    print("   schemes:",
-          sc.where((F.col("SYS_TYPE") == "GROUP") & (F.col("SYS_CODE") == "COVID19_GSSK_EXTENSION"))
-            .select(F.regexp_replace("SYS_DESC", r"\|", "").alias("mph")).distinct().count())
+    One row per (MFI scheme, age) over members whose UPLOAD_TYPE = 'MD'.
+    total_outstanding_period comes from a control-break loop ordered by age;
+    its three quirks are reproduced:
+      1. a NULL cover end date makes the whole age group's total NULL;
+      2. members with a NULL age are added to the scheme's HIGHEST age group
+         (NULL sorts last and `v_age <> NULL` never triggers the break);
+      3. the NULL-age row itself is never updated, so its total stays NULL.
+    """
+    # driver: joined rows, multiplicity kept (a duplicated extn row -> duplicated output)
+    driver = (mpc.select("MASTER_POLICY_NO", "AGENT_CODE")
+                 .join(mpe.where(F.col("MFI_FLAG") == "Y").select("MASTER_POLICY_NO"), "MASTER_POLICY_NO"))
+    members = (cert_pre.where(F.col("UPLOAD_TYPE") == "MD")
+               .join(driver.select("MASTER_POLICY_NO").distinct(), "MASTER_POLICY_NO", "left_semi")
+               .select("MASTER_POLICY_NO", "AGE", "BASIC_SA_GRANTED", "BASIC_LIFE_COVER_PREMIUM", "LOAN_TENURE",
+                       # (risk_coverage_end_date + 1) - valuation_date, in days
+                       ((F.unix_timestamp("RISK_COVERAGE_END_DATE").cast(T.DecimalType(20, 0)) + 86400 - VAL_EPOCH)
+                        / F.lit(86400)).cast(NUM).alias("dur")))
 
-# 3c. azbj_grp_invest_monthly: rows at and after the valuation date
-print("3c. azbj_grp_invest_monthly rows at / after valuation date")
-if need("azbj_grp_invest_monthly"):
-    im = tbl("azbj_grp_invest_monthly").withColumn("d", F.to_date("DATE_OF_PAYMENT"))
-    im.where(F.col("d") == VAL_DATE).agg(F.count(F.lit(1)).alias("rows_at_val_date"),
-                                         F.countDistinct("CONTRACT_ID").alias("contracts")).show()
-    (im.where(F.col("d") > VAL_DATE).groupBy("d")
-       .agg(F.count(F.lit(1)).alias("rows"), F.countDistinct("CONTRACT_ID").alias("contracts"))
-       .orderBy("d").show(50))
-    print("   negative account_value at val date:",
-          im.where((F.col("d") == VAL_DATE) & (F.col("ACCOUNT_VALUE") < 0)).count())
+    grp = (members.groupBy("MASTER_POLICY_NO", "AGE")
+           .agg(F.sum("BASIC_SA_GRANTED").cast(NUM).alias("SUM_INSURED"),
+                F.sum("BASIC_LIFE_COVER_PREMIUM").cast(NUM).alias("SINGLE_PREMIUM"),
+                F.count(F.lit(1)).cast(NUM).alias("NO_OF_MEMBERS"),
+                F.avg("LOAN_TENURE").cast(NUM).alias("POLICY_TERM")))
 
-# 3d. GGG/GLE/GSG/GLTP account values at the valuation date
-print("3d. azbj_grp_acc_value_dtls_temp at valuation date, by scheme type and event")
-if need("azbj_grp_acc_value_dtls_temp", "azbj_master_policy_contract"):
-    av = tbl("azbj_grp_acc_value_dtls_temp").withColumn("d", F.to_date("DATE_OF_PAYMENT"))
-    mpc = tbl("azbj_master_policy_contract").select("MASTER_POLICY_NO", "SCHEME_TYPE")
-    (av.where(F.col("d") == VAL_DATE).join(mpc, "MASTER_POLICY_NO", "left")
-       .groupBy("SCHEME_TYPE", "EVENT_TYPE_CODE")
-       .agg(F.count(F.lit(1)).alias("rows"),
-            F.sum(F.col("CLOSING_BALANCE").isNull().cast("int")).alias("null_closing_balance"))
-       .orderBy("SCHEME_TYPE", "EVENT_TYPE_CODE").show(100, truncate=False))
+    max_age = members.groupBy("MASTER_POLICY_NO").agg(F.max("AGE").alias("max_age"))
+    tot = (members.join(max_age, "MASTER_POLICY_NO")
+           .withColumn("grp_age", F.coalesce(F.col("AGE"), F.col("max_age")))            # quirk 2
+           .groupBy("MASTER_POLICY_NO", "grp_age")
+           .agg(F.sum("dur").alias("s"), F.sum(F.col("dur").isNull().cast("int")).alias("n_null"))
+           .select(F.col("MASTER_POLICY_NO").alias("t_mph"), F.col("grp_age"),
+                   F.when(F.col("n_null") == 0, F.col("s")).cast(NUM).alias("TOTAL_OUTSTANDING_PERIOD")))  # quirk 1
+
+    out = (driver.join(grp, "MASTER_POLICY_NO")
+           .join(tot, (F.col("MASTER_POLICY_NO") == F.col("t_mph")) & (F.col("AGE") == F.col("grp_age")), "left"))  # quirk 3
+    avg = (F.round(F.col("TOTAL_OUTSTANDING_PERIOD") / F.col("NO_OF_MEMBERS"), 2).cast(NUM)
+           if APPLY_GCPL_DELETE2 else F.lit(None).cast(NUM))
+    return out.select(
+        F.col("MASTER_POLICY_NO"), F.col("SUM_INSURED"), F.col("SINGLE_PREMIUM"),
+        F.col("AGE").cast(NUM).alias("AGE"), F.col("NO_OF_MEMBERS"), F.col("POLICY_TERM"),
+        F.col("AGENT_CODE").alias("CHANNEL"),
+        avg.alias("AVERAGE_OUTSTANDING_PERIOD"), F.col("TOTAL_OUTSTANDING_PERIOD"))
+
+
+# ----------------------------------------------------------------------- main
+def main():
+    spark = build_spark()
+    cert = read_tbl(spark, BRONZE["azbj_certificate_policy"])
+    mpc = read_tbl(spark, BRONZE["azbj_master_policy_contract"])
+    mpe = read_tbl(spark, BRONZE["azbj_master_policy_extn"])
+
+    total_mph = build_total_mph(cert, mpe)
+    total_mph.write.format("delta").mode("overwrite").option("overwriteSchema", "true").save(OUT_BASE + "total_mph")
+
+    dl = build_gcpl_mfi_valuation_dl(cert_pre_moratorium(cert), mpc, mpe)
+    dl.write.format("delta").mode("overwrite").option("overwriteSchema", "true").save(OUT_BASE + "gcpl_mfi_valuation_dl")
+
+    # structural checks (no Oracle target yet -- open item A)
+    t = spark.read.format("delta").load(OUT_BASE + "total_mph")
+    d = spark.read.format("delta").load(OUT_BASE + "gcpl_mfi_valuation_dl")
+    print("total_mph rows:", t.count(), " schemes:", t.select("MASTER_POLICY_NO").distinct().count(),
+          " active members:", t.agg(F.sum("ACTUAL_CNT")).first()[0])
+    print("gcpl_mfi_valuation_dl rows:", d.count(), " schemes:", d.select("MASTER_POLICY_NO").distinct().count(),
+          " members:", d.agg(F.sum("NO_OF_MEMBERS")).first()[0])
+    d.agg(F.sum("SUM_INSURED"), F.sum("SINGLE_PREMIUM"), F.sum("TOTAL_OUTSTANDING_PERIOD"),
+          F.sum(F.col("AGE").isNull().cast("int")).alias("null_age_rows"),
+          F.sum(F.col("TOTAL_OUTSTANDING_PERIOD").isNull().cast("int")).alias("null_total_rows")).show(truncate=False)
+    # how much the before/after-moratorium distinction matters here (open item D)
+    moratorium_md = (cert.where((F.col("ADD_INSRD_RELATION") == "ABC") & (F.col("UPLOAD_TYPE") == "MD"))
+                         .join(d.select("MASTER_POLICY_NO").distinct(), "MASTER_POLICY_NO", "left_semi").count())
+    print("moratorium-marked MD members inside MFI schemes:", moratorium_md,
+          "(0 means the before/after state makes no difference to this table)")
+
+
+if __name__ == "__main__":
+    main()
